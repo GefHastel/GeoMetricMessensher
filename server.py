@@ -24,6 +24,7 @@ GeoMetric — сервер мессенджера со СКВОЗНЫМ ШИФР
 # 1. ИМПОРТЫ
 # ---------------------------------------------------------------------------
 import argparse                                                     # разбор параметров командной строки (--host, --port)
+import base64                                                       # кодирование файлов для выкладки аккаунтов на GitHub
 import hashlib                                                      # хеширование паролей (PBKDF2-SHA256)
 import json                                                         # хранение базы в JSON-файле
 import mimetypes                                                    # определение типа загружаемых файлов
@@ -114,6 +115,236 @@ BACKUP_FILE = DATA_DIR / "backup.json"            # резервная копи�
 for _d in (STATIC_DIR, UPLOAD_DIR, DATA_DIR):     # создаём все нужные папки,
     _d.mkdir(parents=True, exist_ok=True)         # если их ещё нет
 
+
+# ---------------------------------------------------------------------------
+# 2-Б. ПАПКА users: аккаунты отдельными файлами (переживают перезапуск сервера)
+# ---------------------------------------------------------------------------
+# Зачем это нужно: база db.json — один большой файл. Если сервер перезапустится
+# на хостинге или обновит код, такой файл легко потерять, и все аккаунты пропадут.
+# Поэтому каждый аккаунт дополнительно хранится отдельным файлом в папке users.
+# Папка лежит в самом проекте — значит, попадает в репозиторий на GitHub, и при
+# следующем запуске сервер читает её и возвращает аккаунты на место.
+
+
+def pick_users_dir() -> Path:
+    """Выбирает папку users: сначала рядом с server.py (в проекте), иначе — в папке данных."""
+    for env_name in ("GEOMETRIC_USERS_DIR", "GM_USERS_DIR"):       # папку можно указать переменной окружения
+        value = os.environ.get(env_name)                           #   значение переменной
+        if value:                                                  #   оно задано —
+            return Path(value).expanduser()                        #   работаем с ним
+    return BASE_DIR / "users"                                      # иначе — папка users рядом с сервером (в репозитории)
+
+
+def ensure_users_dir() -> Path:
+    """Создаёт папку users и проверяет, что в неё можно писать. Если нельзя — переносит её в папку данных."""
+    global USERS_DIR                                               # меняем общую переменную
+    for candidate in (USERS_DIR, DATA_DIR / "users"):              # сначала основное место, затем запасное
+        try:                                                       # запись может быть запрещена —
+            candidate.mkdir(parents=True, exist_ok=True)           #   создаём папку
+            probe = candidate / ".write-test"                      #   файл для проверки записи
+            probe.write_text("ok", encoding="utf-8")               #   пробуем записать
+            probe.unlink()                                         #   и убираем его
+            USERS_DIR = candidate                                  #   место годится — запоминаем его
+            return candidate                                       #   и сообщаем о нём
+        except Exception:                                          # не получилось —
+            continue                                               #   пробуем следующее место
+    return USERS_DIR                                               # ничего не подошло — оставляем как есть
+
+
+def user_record_ok(rec) -> bool:                                   # признак: запись похожа на аккаунт
+    """Проверяет, что запись — действительно аккаунт (в файле нет мусора)."""
+    return isinstance(rec, dict) and bool(rec.get("username"))      # нужен словарь с логином внутри
+
+
+def user_file(login: str) -> Path:                                 # путь к файлу аккаунта
+    """Возвращает путь к файлу аккаунта внутри папки users."""
+    safe = clean_login(login) or "user"                            # имя файла делаем безопасным (без «/» и прочего)
+    return USERS_DIR / f"{safe}.json"                              # файл аккаунта: users/логин.json
+
+
+def user_digest(rec: dict) -> str:                                 # отпечаток записи
+    """Считает отпечаток аккаунта: по нему видно, менялась ли запись (чтобы не писать файл лишний раз)."""
+    body = {k: v for k, v in rec.items() if k != "updatedAt"}       # поле времени изменения в отпечаток не берём
+    blob = json.dumps(body, ensure_ascii=False, sort_keys=True)     # превращаем запись в текст с постоянным порядком полей
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()           # и считаем отпечаток
+
+
+def write_user_file(rec: dict) -> bool:                            # запись одного аккаунта в файл
+    """Сохраняет один аккаунт в отдельный файл папки users."""
+    login = rec.get("username")                                    # логин аккаунта
+    if not user_record_ok(rec) or not login:                        # если это не аккаунт —
+        return False                                               #   писать нечего
+    path = user_file(login)                                        # куда писать
+    tmp = path.with_suffix(".tmp")                                 # пишем сначала во временный файл
+    try:                                                           # диск может отказать —
+        with open(tmp, "w", encoding="utf-8") as f:                #   открываем временный файл
+            json.dump(rec, f, ensure_ascii=False, indent=2)        #   сохраняем запись (русские буквы не экранируем)
+        os.replace(tmp, path)                                      #   подменяем основной файл одним движением
+    except Exception:                                              # не получилось —
+        return False                                               #   сообщаем об этом
+    USERS_STATE[login] = user_digest(rec)                          # запоминаем отпечаток записанной записи
+    return True                                                    # сообщаем об успехе
+
+
+def read_users_dir() -> dict:                                      # чтение всех аккаунтов из папки
+    """Читает папку users и возвращает словарь «логин → запись аккаунта»."""
+    found = {}                                                     # сюда собираем прочитанное
+    try:                                                           # папки может не быть —
+        files = sorted(USERS_DIR.glob("*.json"))                   #   берём все файлы аккаунтов
+    except Exception:                                              # не получилось прочитать список —
+        return found                                               #   возвращаем пустой результат
+    for path in files:                                             # идём по файлам по порядку
+        try:                                                       # файл может быть битым —
+            with open(path, "r", encoding="utf-8") as f:           #   открываем файл
+                rec = json.load(f)                                 #   разбираем JSON
+        except Exception:                                          #   битый файл —
+            continue                                               #   пропускаем его
+        if user_record_ok(rec):                                    # запись похожа на аккаунт —
+            found[rec["username"]] = rec                           #   запоминаем её по логину
+    return found                                                   # отдаём всё, что прочитали
+
+
+def merge_users_from_dir(db: dict) -> int:                         # слияние папки users с базой
+    """Добавляет в базу аккаунты из папки users (тех, кого в базе нет, и записи посвежее)."""
+    added = 0                                                      # сколько аккаунтов вернули
+    users = db.setdefault("users", {})                             # раздел пользователей в базе
+    for login, rec in read_users_dir().items():                    # проходим по всем файлам аккаунтов
+        current = users.get(login)                                 # что уже есть в базе по этому логину
+        if current is None:                                        # в базе такого аккаунта нет —
+            users[login] = rec                                     #   возвращаем его из файла
+            USERS_STATE[login] = user_digest(rec)                  #   и запоминаем отпечаток файла
+            added += 1                                             #   считаем возвращённые аккаунты
+            continue                                               #   переходим к следующему файлу
+        newer_file = float(rec.get("updatedAt") or 0)              # время изменения в файле
+        newer_db = float(current.get("updatedAt") or 0)            # время изменения в базе
+        if newer_file > newer_db:                                  # файл свежее базы —
+            users[login] = rec                                     #   берём версию из файла
+            USERS_STATE[login] = user_digest(rec)                  #   и запоминаем её отпечаток
+            added += 1                                             #   считаем как восстановленный
+    if added:                                                      # что-то восстановили —
+        print(f"[GeoMetric] Из папки users прочитано аккаунтов: {added}")   # сообщаем в журнал
+    return added                                                   # сколько аккаунтов вернули
+
+
+def sync_users_to_dir() -> int:                                    # запись изменённых аккаунтов в папку users
+    """Сохраняет в папку users все аккаунты, которые изменились с прошлого раза."""
+    written = 0                                                    # сколько файлов записали
+    with USERS_LOCK:                                               # пишем по одному потоку за раз
+        users = DB.get("users", {})                                # все аккаунты базы
+        for login, rec in list(users.items()):                     # идём по каждому аккаунту
+            if not user_record_ok(rec):                            # запись битая —
+                continue                                           #   пропускаем её
+            digest = user_digest(rec)                              # текущий отпечаток записи
+            if USERS_STATE.get(login) == digest:                   # запись не менялась —
+                continue                                           #   файл не трогаем (меньше работы диску)
+            rec["updatedAt"] = time.time()                         # помечаем время изменения записи
+            if write_user_file(rec):                               # пишем файл аккаунта
+                written += 1                                       #   считаем записанное
+        for path in list(USERS_DIR.glob("*.json")):                 # теперь убираем файлы удалённых аккаунтов
+            login = path.stem                                      # логин из имени файла
+            if login not in users:                                 # такого аккаунта в базе больше нет —
+                try:                                               #   удаление может не получиться —
+                    path.unlink()                                  #   удаляем файл
+                    USERS_STATE.pop(login, None)                   #   и забываем его отпечаток
+                except Exception:                                  # не получилось —
+                    pass                                           #   не страшно: попробуем в следующий раз
+    return written                                                 # сколько файлов записали
+
+
+def publish_users_git() -> bool:                                   # выкладка папки users в репозиторий (если он рядом)
+    """Отправляет папку users в репозиторий git — тогда аккаунты не пропадут при обновлении сервера."""
+    if not (BASE_DIR / ".git").exists():                            # репозитория рядом нет —
+        return False                                               #   выкладывать некуда
+    try:                                                           # git может быть не установлен —
+        import shutil as _sh                                        #   берём поиск программ
+        if not _sh.which("git"):                                    #   программы git нет —
+            return False                                            #     выходим
+        import subprocess as _sp                                    #   запускаем git отдельным процессом
+        env = dict(os.environ)                                     #   переменные окружения для git
+        env["GIT_TERMINAL_PROMPT"] = "0"                           #   никаких вопросов про пароль (сервер не должен зависнуть)
+
+        def run(*args):                                            # короткая обёртка запуска git
+            """Запускает команду git и возвращает её результат."""
+            return _sp.run(["git", "-C", str(BASE_DIR), *args], env=env,   # запускаем git в папке проекта
+                           capture_output=True, text=True, timeout=60)     # ждём ответа не дольше минуты
+
+        run("add", "users")                                        # добавляем папку users в набор изменений
+        if not run("diff", "--cached", "--name-only").stdout.strip():   # если изменений нет —
+            return False                                           #   выкладывать нечего
+        run("commit", "-m", "GeoMetric: аккаунты (папка users)")    # записываем изменения
+        if run("push").returncode == 0:                             # отправляем в репозиторий; получилось —
+            print("[GeoMetric] Папка users выложена в репозиторий")  #   сообщаем в журнал
+            return True                                            #   и сообщаем об успехе
+    except Exception:                                              # что-то пошло не так —
+        pass                                                       #   тихо продолжаем: данные уже лежат в файлах
+    return False                                                   # сообщаем, что выложить не удалось
+
+
+def publish_users_github() -> bool:                                 # выкладка через сайт GitHub (по ключу доступа)
+    """Отправляет файлы аккаунтов в репозиторий GitHub по его API (если владелец задал ключ доступа)."""
+    if not (GITHUB_REPO and GITHUB_TOKEN):                          # ключа или адреса репозитория нет —
+        return False                                               #   выкладывать некуда
+    sent = 0                                                        # сколько файлов отправили
+    for path in sorted(USERS_DIR.glob("*.json")):                   # идём по файлам аккаунтов
+        try:                                                        # сеть может подвести —
+            data = base64.b64encode(path.read_bytes()).decode("ascii")   # содержимое файла в виде текста
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/users/{path.name}"   # адрес файла в репозитории
+            sha = ""                                                # отпечаток уже существующего файла в репозитории
+            try:                                                    #   файл может отсутствовать —
+                req = urllib.request.Request(url, headers={         #   спрашиваем у GitHub, есть ли такой файл
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",      #   ключ доступа владельца
+                    "User-Agent": "GeoMetric",                      #   имя программы (GitHub требует этот заголовок)
+                })
+                with urllib.request.urlopen(req, timeout=20) as resp:   # открываем ответ
+                    sha = json.loads(resp.read().decode("utf-8")).get("sha", "")   # берём отпечаток файла
+            except Exception:                                       # файла нет или запрос не удался —
+                sha = ""                                            #   значит файл создаём заново
+            body = {"message": "GeoMetric: аккаунты (папка users)", "content": data, "branch": GITHUB_BRANCH}   # что записываем
+            if sha:                                                 # файл уже есть —
+                body["sha"] = sha                                   #   указываем его отпечаток (иначе GitHub откажет)
+            req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="PUT", headers={   # отправляем запись
+                "Authorization": f"Bearer {GITHUB_TOKEN}",          # ключ доступа владельца
+                "Content-Type": "application/json",                 # тип данных — JSON
+                "User-Agent": "GeoMetric",                          # имя программы
+            })
+            with urllib.request.urlopen(req, timeout=30):           # выполняем запрос
+                sent += 1                                           # считаем отправленное
+        except Exception:                                           # не получилось —
+            continue                                                #   пробуем следующий файл
+    if sent:                                                        # что-то отправили —
+        print(f"[GeoMetric] Файлы аккаунтов отправлены на GitHub: {sent}")   # сообщаем в журнал
+    return bool(sent)                                              # сообщаем, была ли отправка
+
+
+def users_keeper_loop() -> None:                                   # фоновая служба сохранения аккаунтов
+    """Раз в несколько минут пишет аккаунты в папку users и выкладывает её в репозиторий."""
+    while True:                                                    # работаем, пока сервер запущен
+        time.sleep(USERS_PUBLISH_EVERY)                            # ждём между проверками (по умолчанию 5 минут)
+        try:                                                       # любая ошибка не должна ронять сервер —
+            if sync_users_to_dir():                                #   записываем изменившиеся аккаунты; что-то записали —
+                publish_users_github()                             #     выкладываем на GitHub (если задан ключ доступа)
+                publish_users_git()                                #     либо в репозиторий рядом (если он есть)
+        except Exception:                                          # ошибка —
+            continue                                               #   продолжаем работу
+
+
+def start_users_keeper() -> None:                                  # запуск фоновой службы
+    """Запускает фоновую службу, которая хранит аккаунты в папке users."""
+    thread = threading.Thread(target=users_keeper_loop, daemon=True)   # отдельный поток, он не мешает серверу
+    thread.start()                                                 # запускаем поток
+    print(f"[GeoMetric] Аккаунты хранятся отдельно: {USERS_DIR}")   # сообщаем, куда пишутся аккаунты
+
+
+USERS_DIR = pick_users_dir()                                       # папка аккаунтов: рядом с сервером (в проекте) или там, где указано
+USERS_STATE = {}                                                   # логин → отпечаток записи (чтобы не писать файл лишний раз)
+USERS_LOCK = threading.RLock()                                     # замок: файлы аккаунтов пишем по одному потоку за раз
+GITHUB_REPO = os.environ.get("GEOMETRIC_GITHUB_REPO", "")          # «владелец/репозиторий» для выкладки через API GitHub
+GITHUB_TOKEN = os.environ.get("GEOMETRIC_GITHUB_TOKEN", "")        # ключ доступа к GitHub (задаёт владелец проекта)
+GITHUB_BRANCH = os.environ.get("GEOMETRIC_GITHUB_BRANCH", "main")  # ветка репозитория
+USERS_PUBLISH_EVERY = 300                                          # как часто сохранять и выкладывать аккаунты (секунд)
+USERS_DIR = ensure_users_dir()                                     # создаём папку аккаунтов (или переносим её в папку данных)
+
+
 STORY_TTL = 24 * 60 * 60                          # срок жизни истории — 24 часа
 SERVER_VERSION = "1.0"
 # Версия сервера. Меняется ТОЛЬКО по прямой просьбе владельца проекта.
@@ -135,6 +366,7 @@ SYS_ABOUT = "Системные уведомления и помощь"      # �
 
 DEFAULT_SETTINGS = {                              # настройки нового пользователя по умолчанию
     "theme": "dark",                              # тема: dark / light / amoled
+    "lang": "ru",                                 # язык интерфейса: ru / en / de / es
     "sounds": True,                               # звуки сообщений и звонков
     "enterToSend": True,                          # отправлять сообщение по Enter
     "readReceipts": True,                         # отправлять ли галочки «прочитано»
@@ -186,16 +418,18 @@ def read_db_file(path: Path):
 def load_db():
     """Читает базу. Если основной файл потерялся — поднимает резервную копию.
 
-    Это спасает аккаунты, когда сервер перезапускается и не успевает записать базу.
+    Дополнительно база дозаполняется аккаунтами из папки users: они хранятся
+    отдельными файлами и потому переживают перезапуск сервера и обновление кода.
     """
     db = read_db_file(DB_FILE)                                    # сначала основной файл
-    if db is not None:                                            # прочитался —
-        return db                                                 #   работаем с ним
-    db = read_db_file(BACKUP_FILE)                                # иначе — резервная копия
-    if db is not None:                                            # копия есть —
-        print("[GeoMetric] Основная база не найдена — восстановил из резервной копии")   # сообщаем в лог
-        return db                                                 #   и работаем с копией
-    return {"users": {}, "chats": {}, "rooms": {}, "stories": [], "packs": {}, "reports": []}   # пустая база (никаких тестовых аккаунтов)
+    if db is None:                                                # основной файл не прочитался —
+        db = read_db_file(BACKUP_FILE)                            #   пробуем резервную копию
+        if db is not None:                                        # копия есть —
+            print("[GeoMetric] Основная база не найдена — восстановил из резервной копии")   # сообщаем в лог
+    if db is None:                                                # ни файла, ни копии —
+        db = {"users": {}, "chats": {}, "rooms": {}, "stories": [], "packs": {}, "reports": []}   # пустая база (никаких тестовых аккаунтов)
+    merge_users_from_dir(db)                                      # возвращаем аккаунты, сохранённые отдельными файлами
+    return db                                                     # отдаём готовую базу
 
 
 DB = load_db()                                    # загружаем базу при старте
@@ -221,6 +455,7 @@ def save_db():
         with open(tmp, "w", encoding="utf-8") as f:               # пишем в него
             json.dump(DB, f, ensure_ascii=False, indent=2)        # сериализуем (русские буквы не экранируются)
         os.replace(tmp, DB_FILE)                                  # подменяем атомарно — база не «побьётся»
+        sync_users_to_dir()                                       # и сразу пишем аккаунты отдельными файлами (папка users)
         now = time.time()                                         # текущее время
         if now - LAST_BACKUP[0] > 60:                             # если копию давно не делали —
             try:                                                  #   пробуем её обновить
@@ -2911,17 +3146,21 @@ def main():
                         help="папка для данных (сообщения, файлы). По умолчанию — data рядом с сервером")
     args = parser.parse_args()                                    # разбираем аргументы
 
-    global DATA_DIR, UPLOAD_DIR, DB_FILE                          # меняем пути, если пользователь их указал
+    global DATA_DIR, UPLOAD_DIR, DB_FILE, BACKUP_FILE, USERS_DIR   # меняем пути, если пользователь их указал
     if args.data_dir:                                             # флаг передан —
         DATA_DIR = Path(args.data_dir).expanduser().resolve()      #   берём указанную папку
         UPLOAD_DIR = DATA_DIR / "uploads"                          #   файлы складываем внутрь неё
         DB_FILE = DATA_DIR / "db.json"                             #   и базу тоже
+        BACKUP_FILE = DATA_DIR / "backup.json"                     #   и её резервную копию (иначе копия осталась бы в старой папке)
+        USERS_DIR = DATA_DIR / "users"                             #   и папку аккаунтов переносим туда же
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)              #   создаём папки
+        ensure_users_dir()                                         #   создаём папку аккаунтов по новому адресу
         load_into_memory()                                         #   и перечитываем базу из нового места
 
     ensure_socketio_client()                                      # проверяем наличие js-библиотеки socket.io
     ensure_sticker_bot()                                          # создаём служебного Стикер-бота (если его ещё нет)
     ensure_system_user()                                          # создаём служебный аккаунт GeoMetric (владелец проекта)
+    start_users_keeper()                                          # включаем хранение аккаунтов в папке users (они не пропадут)
 
     users = len(DB["users"])                                      # сколько пользователей уже зарегистрировано
     print("=" * 64)
