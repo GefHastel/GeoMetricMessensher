@@ -82,20 +82,56 @@ WWW_DIR = BASE_DIR / "www"                        # интерфейс прил�
 # WWW_DIR используется ТОЛЬКО в режиме предпросмотра (--serve-ui):
 # обычно интерфейс лежит внутри приложений, а сервер отдаёт лишь данные.
 
+def pick_data_dir() -> Path:
+    """Выбирает папку для данных так, чтобы аккаунты НЕ пропадали при перезапуске сервера.
+
+    Порядок такой:
+      1) переменная окружения GEOMETRIC_DATA_DIR (или GM_DATA_DIR) — если её задали;
+      2) постоянный диск хостинга (/var/data/geometric, /data/geometric) — если он есть;
+      3) папка data рядом с сервером (обычный случай для дома и для компьютера).
+    """
+    for env_name in ("GEOMETRIC_DATA_DIR", "GM_DATA_DIR"):        # сначала смотрим переменные окружения
+        value = os.environ.get(env_name)                          #   значение переменной
+        if value:                                                 #   если оно задано —
+            return Path(value).expanduser()                       #   берём его
+    for candidate in (Path("/var/data/geometric"), Path("/data/geometric")):   # затем — постоянные диски хостингов
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)          #   пробуем создать папку
+            if os.access(candidate, os.W_OK):                     #   и проверить запись
+                return candidate                                  #   получилось — работаем здесь
+        except Exception:                                         #   не получилось —
+            continue                                              #   пробуем следующий вариант
+    return BASE_DIR / "data"                                      # иначе — обычная папка рядом с сервером
+
+
 # Папку с данными можно указать снаружи (флаг --data-dir). Это нужно настольному
 # приложению: само приложение лежит в «Program Files», а данные — в профиле пользователя.
-DATA_DIR = Path(os.environ.get("GEOMETRIC_DATA_DIR") or (BASE_DIR / "data"))
+DATA_DIR = pick_data_dir()                        # папка данных (по возможности — постоянная)
 UPLOAD_DIR = DATA_DIR / "uploads"                 # загруженные файлы (в чатах — зашифрованные!)
 DB_FILE = DATA_DIR / "db.json"                    # файл «базы данных»
+BACKUP_FILE = DATA_DIR / "backup.json"            # резервная копия базы (спасает при сбое записи)
 
 for _d in (STATIC_DIR, UPLOAD_DIR, DATA_DIR):     # создаём все нужные папки,
     _d.mkdir(parents=True, exist_ok=True)         # если их ещё нет
 
 STORY_TTL = 24 * 60 * 60                          # срок жизни истории — 24 часа
-SERVER_VERSION = "3.0"
-# Версия сервера (приложение показывает её на экране подключения).
+SERVER_VERSION = "1.0"
+# Версия сервера. Меняется ТОЛЬКО по прямой просьбе владельца проекта.
 MAX_UPLOAD = 128 * 1024 * 1024                    # максимум 128 МБ на файл
 SOCKETIO_JS_URL = "https://cdn.socket.io/4.7.5/socket.io.min.js"   # откуда взять клиент socket.io
+
+BOT_TOKEN_PREFIX = "gm-"                                  # с этих букв начинается токен бота — по нему его легко узнать
+BOT_LIMIT = 20                                            # сколько своих ботов может завести один человек
+BOT_ABOUT_MAX = 200                                       # предел длины описания бота (символов)
+STICKER_LIMIT = 60                                        # сколько стикеров помещается в один набор
+STICKER_MAX_BYTES = 1024 * 1024                           # предел размера одного стикера — 1 МБ
+PACKS_PER_USER = 40                                       # сколько наборов стикеров может создать один человек
+DEVICE_LIMIT = 30                                         # сколько устройств запоминаем в списке устройств
+
+SYS_USER = "geometric"                            # логин служебного аккаунта GeoMetric
+SYS_NAME = "GeoMetric"                           # его имя (с галочкой в интерфейсе)
+SYS_PASSWORD = "GeoMetric5644"                    # пароль владельца проекта
+SYS_ABOUT = "Системные уведомления и помощь"      # описание служебного аккаунта
 
 DEFAULT_SETTINGS = {                              # настройки нового пользователя по умолчанию
     "theme": "dark",                              # тема: dark / light / amoled
@@ -115,26 +151,51 @@ DEFAULT_SETTINGS = {                              # настройки ново�
 DB_LOCK = threading.RLock()                       # мьютекс: защищает базу от одновременной записи
 SID_TO_USER = {}                                  # socket-соединение -> логин
 TOKENS = {}                                       # токен сессии -> логин
+TOKEN_DEVICE = {}                                 # токен сессии -> id устройства (нужно для списка устройств)
+BOT_STATE = {}                                    # состояние Стикер-бота: логин человека -> что ждём от него
 CALLS = {}                                        # активные звонки: call_id -> данные
 
 
 # ---------------------------------------------------------------------------
 # 3. БАЗА ДАННЫХ (JSON-файл)
 # ---------------------------------------------------------------------------
+def fill_db(db: dict) -> dict:
+    """Дозаполняет базу недостающими разделами — чтобы файл старой версии тоже подошёл."""
+    db.setdefault("users", {})                                    # пользователи
+    db.setdefault("chats", {})                                    # личные переписки
+    db.setdefault("rooms", {})                                    # комнаты: группы и каналы
+    db.setdefault("packs", {})                                    # наборы стикеров
+    db.setdefault("stories", [])                                  # истории
+    if not isinstance(db.get("reports"), list):                    # если жалобы в базе хранятся не списком (старый файл) —
+        db["reports"] = []                                        #   приводим к списку
+    db.setdefault("reports", [])                                  # жалобы пользователей (их видит только владелец)
+    return db                                                     # отдаём базу
+
+
+def read_db_file(path: Path):
+    """Пробует прочитать файл базы. Возвращает словарь или None, если файла нет или он битый."""
+    if not path.exists():                                         # файла нет —
+        return None                                               #   читать нечего
+    try:                                                          # пробуем прочитать
+        with open(path, "r", encoding="utf-8") as f:              #   открываем
+            return fill_db(json.load(f))                          #   разбираем JSON и дозаполняем
+    except Exception:                                             # файл битый —
+        return None                                               #   сообщаем, что прочитать не вышло
+
+
 def load_db():
-    """Читает базу. Если файла нет — создаёт пустую (никаких тестовых аккаунтов!)."""
-    if DB_FILE.exists():                                          # файл существует?
-        try:                                                      # пробуем прочитать
-            with open(DB_FILE, "r", encoding="utf-8") as f:       #   открываем
-                db = json.load(f)                                 #   разбираем JSON
-                db.setdefault("users", {})                        #   на всякий случай дозаполняем структуру,
-                db.setdefault("chats", {})                        #   если файл из старой версии
-                db.setdefault("rooms", {})                        #   комнаты: группы и каналы
-                db.setdefault("stories", [])                      #
-                return db                                         #   отдаём базу
-        except Exception:                                         # файл битый —
-            pass                                                  #   начнём с пустой
-    return {"users": {}, "chats": {}, "rooms": {}, "stories": []}   # пустая база (никаких тестовых аккаунтов)
+    """Читает базу. Если основной файл потерялся — поднимает резервную копию.
+
+    Это спасает аккаунты, когда сервер перезапускается и не успевает записать базу.
+    """
+    db = read_db_file(DB_FILE)                                    # сначала основной файл
+    if db is not None:                                            # прочитался —
+        return db                                                 #   работаем с ним
+    db = read_db_file(BACKUP_FILE)                                # иначе — резервная копия
+    if db is not None:                                            # копия есть —
+        print("[GeoMetric] Основная база не найдена — восстановил из резервной копии")   # сообщаем в лог
+        return db                                                 #   и работаем с копией
+    return {"users": {}, "chats": {}, "rooms": {}, "stories": [], "packs": {}, "reports": []}   # пустая база (никаких тестовых аккаунтов)
 
 
 DB = load_db()                                    # загружаем базу при старте
@@ -146,13 +207,118 @@ def load_into_memory():
     DB = load_db()                                               #   читаем базу заново
 
 
+LAST_BACKUP = [0.0]                                             # когда последний раз писали резервную копию
+
+
 def save_db():
-    """Атомарно сохраняет базу: сначала во временный файл, потом подменяет основной."""
+    """Атомарно сохраняет базу: сначала во временный файл, потом подменяет основной.
+
+    Дополнительно раз в минуту пишется резервная копия (backup.json). Если основной
+    файл когда-нибудь потеряется, сервер сам поднимет копию — аккаунты не пропадут.
+    """
     with DB_LOCK:                                                 # только по одному потоку за раз
         tmp = DB_FILE.with_suffix(".tmp")                         # временный файл
         with open(tmp, "w", encoding="utf-8") as f:               # пишем в него
             json.dump(DB, f, ensure_ascii=False, indent=2)        # сериализуем (русские буквы не экранируются)
         os.replace(tmp, DB_FILE)                                  # подменяем атомарно — база не «побьётся»
+        now = time.time()                                         # текущее время
+        if now - LAST_BACKUP[0] > 60:                             # если копию давно не делали —
+            try:                                                  #   пробуем её обновить
+                btmp = BACKUP_FILE.with_suffix(".tmp")            #   временный файл копии
+                with open(btmp, "w", encoding="utf-8") as f:      #   пишем копию
+                    json.dump(DB, f, ensure_ascii=False, indent=2)   #   тем же составом
+                os.replace(btmp, BACKUP_FILE)                     #   и подменяем атомарно
+                LAST_BACKUP[0] = now                              #   запоминаем время копии
+            except Exception:                                     # копия не удалась —
+                pass                                              #   основной файл всё равно записан
+
+
+def safe_emit(event: str, data: dict | None = None, room: str | None = None) -> None:
+    """Отправляет событие в живой канал, если это возможно.
+
+    Из обычного HTTP-запроса (например, при смене логина) живого канала рядом нет —
+    тогда событие просто не отправляется, а данные всё равно сохранятся в базе.
+    """
+    try:                                                          # пробуем отправить
+        emit(event, data or {}, room=room)                        #   в живой канал
+    except Exception:                                             # канала нет (обычный запрос) —
+        pass                                                      #   молча продолжаем
+
+
+def clean_login(raw: str) -> str:
+    """Приводит логин к безопасному виду: латиница, цифры и подчёркивание, не длиннее 32 символов."""
+    text = str(raw or "").strip().lower()                         # убираем пробелы и приводим к нижнему регистру
+    return "".join(ch for ch in text if ch.isalnum() or ch == "_")[:32]   # оставляем только разрешённые символы
+
+
+def login_ok(value: str) -> bool:
+    """Проверяет, годится ли логин (минимум 3 символа, только латиница, цифры и подчёркивание)."""
+    return len(value) >= 3 and all(ch.isalnum() or ch == "_" for ch in value)   # простое правило
+
+
+def ensure_system_user():
+    """Создаёт служебный аккаунт GeoMetric (с галочкой) — от него приходят системные уведомления."""
+    with DB_LOCK:                                                 # меняем базу под замком
+        users = DB["users"]                                       # все пользователи
+        rec = users.get(SYS_USER)                                 # запись служебного аккаунта
+        if not rec:                                               # аккаунта ещё нет —
+            pub, enc_priv, kek_salt = "", "", ""                  # у служебного аккаунта нет личных ключей шифрования
+            users[SYS_USER] = {                                   # создаём запись
+                "username": SYS_USER,                             # логин
+                "name": SYS_NAME,                                 # имя
+                "bio": SYS_ABOUT,                                 # описание
+                "avatar": {"kind": "color", "value": "#4c6ef5"},  # аватар-цвет
+                "password": hash_password(SYS_PASSWORD),          # пароль владельца (хранится только хешем)
+                "pub": pub, "encPriv": enc_priv, "kekSalt": kek_salt,
+                "settings": dict(DEFAULT_SETTINGS),               # настройки по умолчанию
+                "created": time.time(),                           # когда создан
+                "online": False, "last_seen": time.time(),        # статусы
+                "is_system": True,                                # служебный аккаунт (не бот, не человек)
+                "verified": True,                                 # галочка «проверенный»
+                "is_admin": True,                                 # владелец проекта: видит жалобы
+            }
+            print("[GeoMetric] Создан служебный аккаунт GeoMetric (владелец проекта)")   # сообщаем в лог
+        else:                                                     # аккаунт уже есть —
+            rec.setdefault("is_system", True)                      #   гарантируем нужные признаки
+            rec["verified"] = True                                 #   галочка
+            rec["is_admin"] = True                                 #   права владельца
+            if not rec.get("password"):                            #   если пароля нет (битая запись) —
+                rec["password"] = hash_password(SYS_PASSWORD)       #     ставим пароль владельца
+        save_db()                                                  # сохраняем базу
+
+
+def is_admin(username: str) -> bool:
+    """Владелец проекта (видит жалобы и может блокировать нарушителей)."""
+    return bool((DB["users"].get(username) or {}).get("is_admin"))
+
+
+def admins() -> list:
+    """Список логинов владельцев проекта (им приходят жалобы)."""
+    return [name for name, u in DB["users"].items() if u.get("is_admin")]   # по признаку в записи
+
+
+def system_notice(to: str, text: str) -> None:
+    """Отправляет человеку системное уведомление в чат с GeoMetric (это обычное сообщение)."""
+    if to not in DB["users"] or to == SYS_USER:                    # такого человека нет или это сам сервис —
+        return                                                     #   ничего не делаем
+    cid = chat_id(SYS_USER, to)                                    # ID чата «GeoMetric ↔ человек»
+    msg = {
+        "id": uuid.uuid4().hex,                                    # уникальный ID
+        "chat": cid,                                               # чат
+        "from": SYS_USER,                                          # отправитель — служба GeoMetric
+        "to": to,                                                  # получатель
+        "kind": "text",                                            # обычное текстовое сообщение
+        "e2e": None,                                               # шифровать нечего: это служебная строка
+        "plain": {"t": text, "system": True},                      # текст сообщения (открытый — оно системное)
+        "call": None,                                              # это не звонок
+        "ts": time.time(),                                         # время
+        "read": False,                                             # ещё не прочитано
+    }
+    with DB_LOCK:                                                  # пишем в базу
+        get_chat(cid)["messages"].append(msg)                      # добавляем сообщение в переписку
+        save_db()                                                  # сохраняем
+    safe_emit("new_message", msg, room=f"u:{to}")                       # отправляем человеку на все его устройства
+    safe_emit("chats_update", {"chats": chat_list_for(to)}, room=f"u:{to}")   # и обновляем список чатов
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +353,95 @@ def user_by_token(token):
 
 
 # ---------------------------------------------------------------------------
+# 4-Б. УСТРОЙСТВА: с каких устройств человек входил в аккаунт
+# ---------------------------------------------------------------------------
+def client_ip():                                              # адрес, с которого пришёл запрос
+    """Возвращает «человеческий» IP клиента (за прокси — из заголовка X-Forwarded-For)."""
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()   # первый адрес в цепочке
+    return forwarded or request.remote_addr or ""             # если заголовка нет — обычный адрес
+
+
+def detect_platform(ua: str, given: str = "") -> str:           # как подписывать устройство в списке
+    """Определяет платформу устройства по подсказкам и по User-Agent.
+
+    Важно для пользователя: в списке устройств должно быть видно «Приложение для ПК»,
+    «Приложение для Android», «Веб-версия» — а не расплывчатое «браузер».
+    """
+    text = (given or "").strip().lower()                       # подсказка от клиента
+    if "geometricdesktop" in text or "geometric pc" in text:    # приложение для компьютера
+        return "Приложение для ПК"
+    if "geometricapp" in text or "android" in text:             # приложение для телефона
+        return "Приложение для Android"
+    if "ios" in text or "iphone" in text or "ipad" in text:     # приложение для iPhone/iPad
+        return "Приложение для iPhone"
+    if "web" in text or "браузер" in text or "browser" in text: # сайт в браузере
+        return "Веб-версия (браузер)"
+    ua_low = (ua or "").lower()                                 # тот же разбор по User-Agent
+    if "geometricdesktop" in ua_low:
+        return "Приложение для ПК"
+    if "geometricapp" in ua_low or "android" in ua_low:
+        return "Приложение для Android"
+    if "iphone" in ua_low or "ipad" in ua_low or "ios" in ua_low:
+        return "Приложение для iPhone"
+    if ua_low:                                                  # остальное считаем браузером
+        return "Веб-версия (браузер)"
+    return "Устройство"                                         # совсем ничего не поняли
+
+
+def remember_device(username, device):                        # записать устройство в профиль
+    """Запоминает устройство входа: имя, систему, время. Нужно для списка устройств в настройках."""
+    info = device or {}                                       # данные от приложения (может быть пусто)
+    did = str(info.get("id") or "unknown")[:64]                # идентификатор устройства (его придумывает приложение)
+    name = str(info.get("name") or "Это устройство")[:60]      # понятное имя: «Телефон», «Ноутбук»
+    platform = detect_platform(request.headers.get("User-Agent", ""), str(info.get("platform") or ""))[:40]   # понятная система
+    with DB_LOCK:                                             # меняем базу под замком
+        u = DB["users"].get(username)                         # запись самого человека
+        if not u:                                             # если человека нет —
+            return None                                       #   ничего не делаем
+        devices = u.setdefault("devices", {})                  # список его устройств
+        rec = devices.get(did) or {"id": did, "created": time.time()}   # старая запись или новая
+        rec.update({"name": name, "platform": platform, "ip": client_ip(), "last_seen": time.time()})   # обновляем данные
+        devices[did] = rec                                    # сохраняем обратно
+        u["last_platform"] = platform                         # запоминаем, с чего человек заходил последний раз
+        if len(devices) > DEVICE_LIMIT:                       # устройств стало слишком много —
+            oldest = sorted(devices.values(), key=lambda d: d.get("last_seen", 0))[0]   # находим самое старое
+            devices.pop(oldest.get("id"), None)               #   и забываем его
+        save_db()                                             # пишем базу на диск
+    return did                                                # отдаём идентификатор устройства
+
+
+def devices_payload(username, current_device=None):           # список устройств для настроек
+    """Собирает список устройств человека: имя, система, когда заходил и какое устройство сейчас."""
+    u = DB["users"].get(username) or {}                       # запись человека
+    out = []                                                  # сюда собираем ответ
+    for dev in (u.get("devices") or {}).values():             # по всем известным устройствам
+        out.append({                                          # описываем одно устройство
+            "id": dev.get("id"),                              #   идентификатор
+            "name": dev.get("name") or "Устройство",          #   имя
+            "platform": dev.get("platform") or "",            #   система
+            "ip": dev.get("ip") or "",                        #   адрес (виден только владельцу)
+            "created": dev.get("created", 0),                 #   когда устройство впервые вошло
+            "last_seen": dev.get("last_seen", 0),             #   когда было в сети последний раз
+            "current": dev.get("id") == current_device,       #   это то устройство, где мы сейчас смотрим?
+        })
+    out.sort(key=lambda d: d.get("last_seen", 0), reverse=True)   # свежие устройства — сверху
+    return out                                                # отдаём список
+
+
+def drop_device(username, device_id):                         # «выйти» с устройства
+    """Убирает устройство и все его сессии: после этого с него потребуется вход заново."""
+    with DB_LOCK:                                             # меняем базу под замком
+        u = DB["users"].get(username)                         # запись человека
+        if u:                                                 # если человек есть —
+            (u.get("devices") or {}).pop(device_id, None)     #   забываем устройство
+            save_db()                                         #   и сохраняем
+    for tok, meta in list(TOKEN_DEVICE.items()):              # теперь гасим все токены этого устройства
+        if meta[0] == username and meta[1] == device_id:      # токен принадлежит человеку и устройству
+            TOKENS.pop(tok, None)                             #   забываем токен
+            TOKEN_DEVICE.pop(tok, None)                       #   и его привязку
+
+
+# ---------------------------------------------------------------------------
 # 5. ПОЛЬЗОВАТЕЛИ (с учётом приватности!)
 # ---------------------------------------------------------------------------
 def contacts_of(username):
@@ -213,6 +468,24 @@ def public_user(username, viewer=None):
     st = u.get("settings", {})                                    # настройки приватности пользователя
     show_presence = is_me or (is_contact and not st.get("hideOnline"))     # показывать ли «в сети»
     show_last = is_me or (is_contact and not st.get("hideLastSeen"))       # показывать ли «был(а) ...»
+    blocked_me = bool(viewer) and viewer in (u.get("blocked") or [])   # этот человек меня заблокировал?
+    i_blocked = bool(viewer) and username in ((DB["users"].get(viewer) or {}).get("blocked") or [])   # я его заблокировал?
+    if blocked_me:                                                # если он меня заблокировал —
+        return {                                                  #   он для меня «почти невидим»
+            "username": username,                                 #   логин
+            "name": u.get("name", username),                      #   имя оставляем (иначе непонятно, кто это)
+            "bio": "",                                            #   описание скрываем
+            "avatar": {"kind": "color", "value": "#2a2f3d"},      #   аватарка пропадает (серый кружок)
+            "pub": None,                                          #   ключа не даём: писать всё равно нельзя
+            "online": False,                                      #   «в сети» не показываем
+            "last_seen": 0,                                       #   «был(а) давно»
+            "hidden_presence": True,                              #   статус скрыт
+            "blocked": True,                                      #   признак: он меня заблокировал
+            "verified": False,                                    #   галочку тоже прячем
+            "bot": bool(u.get("is_bot")),                         #   бот или нет
+            "birthday": "",                                       #   день рождения скрыт
+            "pinned": "",                                         #   закреплённый канал скрыт
+        }
     return {
         "username": username,                                     # логин
         "name": u.get("name", username),                          # имя
@@ -222,6 +495,13 @@ def public_user(username, viewer=None):
         "online": bool(u.get("online")) if show_presence else False,          # статус «в сети»
         "last_seen": u.get("last_seen") if show_last else None,   # «был(а) недавно» (или None — скрыто)
         "hidden_presence": not show_presence,                     # флаг: статус скрыт (клиент покажет «недавно»)
+        "verified": bool(u.get("verified")),                      # галочка «проверенный аккаунт»
+        "bot": bool(u.get("is_bot")),                             # бот или нет
+        "system": bool(u.get("is_system")),                       # служебный аккаунт GeoMetric
+        "blocked": False,                                         # он меня не блокировал
+        "i_blocked": i_blocked,                                   # я его заблокировал (клиент покажет «разблокировать»)
+        "birthday": (u.get("birthday") or "") if (is_me or is_contact) else "",   # день рождения видят контакты
+        "pinned": u.get("pinned") or "",                          # закреплённый канал (его ID)
     }
 
 
@@ -231,7 +511,15 @@ def me_payload(username):
     card = public_user(username, username)                        # карточка «для себя»
     card["settings"] = u.get("settings", dict(DEFAULT_SETTINGS))  # добавляем настройки
     card["has_keys"] = bool(u.get("pub") and u.get("encPriv"))    # сгенерированы ли ключи шифрования
+    card["bot"] = bool(u.get("is_bot"))                           # это бот? (в интерфейсе — значок «бот»)
+    card["system"] = bool(u.get("is_system"))                     # служебный аккаунт GeoMetric
+    card["verified"] = bool(u.get("verified"))                    # галочка «проверенный»
+    card["admin"] = bool(u.get("is_admin"))                       # владелец проекта (видит жалобы)
+    card["birthday"] = u.get("birthday") or ""                    # день рождения (виден контактам)
+    card["pinned"] = u.get("pinned") or ""                        # закреплённый личный канал
+    card["blocked_users"] = list(u.get("blocked") or [])          # кого я заблокировал
     card["created"] = u.get("created", 0)                         # дата регистрации
+    card["platform"] = u.get("last_platform") or ""               # с какого устройства заходил последний раз
     return card                                                   # отдаём
 
 
@@ -241,6 +529,70 @@ def me_payload(username):
 def chat_id(a, b):
     """ID личного чата — одинаковый с обеих сторон."""
     return "|".join(sorted([a, b]))                               # сортируем логины и соединяем
+
+
+def ensure_dm_chat(cid: str) -> bool:
+    """Создаёт личный чат, если его ещё нет (нужно для настроек чата до первого сообщения)."""
+    parts = [p for p in cid.split("|") if p != "s"]               # участники без отметки «секретный»
+    if len(parts) != 2:                                           # это не личный чат (например, комната) —
+        return False                                              #   создавать нечего
+    if any(part not in DB["users"] for part in parts):             # кого-то из участников нет —
+        return False                                              #   тоже не создаём
+    get_chat(cid)                                                 # создаём переписку (если её ещё нет)
+    return True                                                   # сообщаем об успехе
+
+
+def chat_meta(cid: str) -> dict:
+    """Настройки чата: обои, «без звука», скрытие из списка, секретность, очистка истории."""
+    meta = get_chat(cid).setdefault("meta", {})                  # раздел настроек внутри чата
+    meta.setdefault("muted", {})                                 # кому чат «без звука» (логин → True)
+    meta.setdefault("cleared", {})                               # кому история очищена (логин → время)
+    meta.setdefault("hidden", [])                                # кто убрал чат из своего списка
+    meta.setdefault("wallpaper", None)                           # обои для обоих (если меняли «у всех»)
+    meta.setdefault("wallpaper_me", {})                          # личные обои (логин → обои)
+    meta.setdefault("deleted_for", {})                           # кому какое сообщение не показывать
+    meta.setdefault("secret", bool(meta.get("secret")))           # это секретный чат?
+    return meta                                                  # отдаём настройки
+
+
+def secret_chat_id(a: str, b: str) -> str:
+    """ID секретного чата: та же пара людей, но отдельная переписка (с замочком)."""
+    return chat_id(a, b) + "|s"                                  # добавляем отметку «секретный»
+
+
+def chat_is_secret(cid: str) -> bool:
+    """Это секретный чат? (по его ID)"""
+    return cid.endswith("|s")                                    # отметка в конце ID
+
+
+def dm_peer(cid: str, me: str) -> str:
+    """Кто собеседник в личном чате (учитывает «Избранное» и секретные чаты)."""
+    parts = [p for p in cid.split("|") if p != "s"]              # убираем служебную отметку «секретный»
+    if len(parts) >= 2 and parts[0] == parts[1]:                 # «Избранное» (чат с самим собой)
+        return me                                                #   собеседник — я сам
+    return next((p for p in parts if p != me), "") or ""         # иначе — второй участник
+
+
+def visible_messages(cid: str, me: str, limit: int = 800) -> list:
+    """Сообщения чата, которые положено показывать этому человеку.
+
+    Учитываются: удаление «у меня»/«у всех», очистка истории и блокировка.
+    """
+    chat = DB["chats"].get(cid) or {}                             # запись чата
+    msgs = chat.get("messages", [])                               # все сообщения
+    meta = chat.get("meta") or {}                                 # настройки чата
+    since = (meta.get("cleared") or {}).get(me, 0)                # когда я очищал историю
+    hidden_for_me = set((meta.get("deleted_for") or {}).get(me, []))   # что я удалил «у себя»
+    out = []                                                      # результат
+    for m in msgs:                                                # проходим по сообщениям
+        if m.get("deleted"):                                      # удалено «у всех» —
+            continue                                              #   не показываем
+        if m["id"] in hidden_for_me:                              # удалено «у меня» —
+            continue                                              #   не показываем
+        if m.get("ts", 0) <= since:                               # было раньше очистки истории —
+            continue                                              #   не показываем
+        out.append(m)                                             # иначе — показываем
+    return out[-limit:]                                           # отдаём последние сообщения
 
 
 def get_chat(cid):
@@ -269,18 +621,29 @@ def chat_list_for(username):
     """Список чатов для сайдбара: собеседник, последний «конверт», непрочитанные, комнаты."""
     out = []                                                      # сюда собираем результат
     for cid in chats_of(username):                                # по всем моим личным чатам
-        parts = cid.split("|")                                    # логины участников
+        parts = [p for p in cid.split("|") if p != "s"]           # логины участников (без отметки «секретный»)
         saved = len(parts) == 2 and parts[0] == parts[1]          # «Избранное» — чат с самим собой
         peer = username if saved else next((p for p in parts if p != username), "")   # кто собеседник
-        last = last_message(cid)                                  # последнее сообщение
+        secret = chat_is_secret(cid)                              # это секретный чат?
+        meta = chat_meta(cid)                                     # настройки чата
+        if username in (meta.get("hidden") or []):                # я убрал этот чат из списка —
+            continue                                              #   не показываем
+        peer_card = public_user(peer, username) or {}             # карточка собеседника
+        if peer_card.get("blocked") and not secret:               # он меня заблокировал —
+            continue                                              #   чата в списке больше нет
+        msgs = visible_messages(cid, username, 1)                 # видимые мне сообщения (последнее нужно для превью)
+        last = msgs[-1] if msgs else None                         # последнее видимое сообщение
         out.append({
             "kind": "saved" if saved else "dm",                   # вид строки: Избранное или личный чат
             "id": cid,                                            # ID чата
             "with": peer,                                         # логин собеседника
-            "peer": public_user(peer, username),                  # его карточка (с публичным ключом!)
+            "peer": peer_card,                                    # его карточка (с публичным ключом!)
             "last": last,                                         # последнее сообщение — «конверт» (клиент расшифрует сам)
             "ts": last["ts"] if last else 0,                      # время (для сортировки)
-            "unread": unread_count(cid, username),                # непрочитанных
+            "unread": 0 if (meta.get("muted", {}) or {}).get(username) else unread_count(cid, username),   # непрочитанных (в «без звука» не считаем)
+            "secret": secret,                                     # секретный чат (в интерфейсе — замочек)
+            "muted": bool((meta.get("muted", {}) or {}).get(username)),   # чат «без звука»
+            "wallpaper": (meta.get("wallpaper_me", {}) or {}).get(username) or meta.get("wallpaper"),   # обои чата
         })
     out.extend(room_list_for(username))                           # добавляем группы и каналы
     out.sort(key=lambda c: c["ts"], reverse=True)                 # свежие чаты сверху
@@ -376,11 +739,14 @@ def broadcast_presence(username):
 # в нём сервер дополнительно отдаёт файлы интерфейса, чтобы приложение можно было
 # открыть в браузере без сборки APK/EXE. В обычной работе интерфейс лежит внутри
 # приложений, и сервер отдаёт только данные.
-SERVE_UI = "--serve-ui" in sys.argv                       # включён ли режим предпросмотра
-if SERVE_UI:                                              # режим предпросмотра —
+# Веб-версия приложения включена ВСЕГДА: открыв адрес сервера в браузере, человек попадает
+# в само приложение (та же программа, что и в APK). Флаг --api-only оставляет только API —
+# это нужно, если сервер работает строго «как хранилище сообщений».
+SERVE_UI = "--api-only" not in sys.argv                    # отдавать ли интерфейс вместе с данными
+if SERVE_UI:                                              # обычный режим (он же веб-версия) —
     app = Flask(__name__, static_folder=str(WWW_DIR), static_url_path="")   #   файлы интерфейса из папки www
-else:                                                     # обычный режим —
-    app = Flask(__name__, static_folder=None)             #   сервер — только API: файлы интерфейса не раздаёт
+else:                                                     # режим «только данные» --
+    app = Flask(__name__, static_folder=None)             #   файлы интерфейса не раздаются
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD                     # лимит размера загрузки
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")        # WebSocket-сервер
 
@@ -407,17 +773,16 @@ def ensure_socketio_client():
 def status_page():
     """Главная страница сервера.
 
-    В обычном режиме здесь только служебная справка (JSON) — интерфейса мессенджера нет,
-    он лежит внутри приложения (APK/EXE). Если сервер запущен с флагом --serve-ui
-    (предпросмотр), то по этому адресу открывается сам интерфейс приложения."""
-    if SERVE_UI:                                              # режим предпросмотра —
+    По этому адресу открывается веб-версия приложения (та же программа, что в APK и EXE).
+    Если сервер запущен с флагом --api-only, вместо интерфейса отдаётся служебная справка."""
+    if SERVE_UI:                                              # веб-версия включена —
         return send_from_directory(WWW_DIR, "index.html")      #   показываем интерфейс приложения
     return jsonify({
         "geometric": True,                                        # признак «это действительно сервер GeoMetric»
         "name": "GeoMetric Server",                               # название сервиса
         "version": SERVER_VERSION,                                # версия сервера
         "users": len(DB["users"]),                                # сколько аккаунтов зарегистрировано
-        "e2ee": True,                                             # сервер хранит только шифротексты
+        "e2ee": True,                                             # содержимое серверу не видно (технический флаг)
         "time": time.time(),                                      # текущее время сервера
     })
 
@@ -430,7 +795,7 @@ def api_status():
         "geometric": True,                                        # «я — сервер GeoMetric»
         "version": SERVER_VERSION,                                # версия
         "users": len(DB["users"]),                                # число аккаунтов
-        "e2ee": True,                                             # поддержка сквозного шифрования
+        "e2ee": True,                                             # содержимое серверу не видно (технический флаг)
     })
 
 
@@ -462,15 +827,15 @@ def allow_cross_origin(resp):
 def api_register():
     """Регистрация. Клиент присылает свою публичную пару ключей (E2EE готовится в браузере)."""
     data = request.get_json(silent=True) or {}                    # читаем данные
-    username = (data.get("username") or "").strip().lower()       # логин — латиница, в нижнем регистре
+    username = clean_login(data.get("username"))                  # логин — латиница, цифры и подчёркивание
     password = data.get("password") or ""                         # пароль
     name = (data.get("name") or username).strip()[:40]            # отображаемое имя
     pub = data.get("pub")                                         # публичный ключ шифрования (JWK)
     enc_priv = data.get("encPriv")                                # приватный ключ, зашифрованный паролем
     kek_salt = data.get("kekSalt")                                # соль для вывода ключа из пароля
 
-    if len(username) < 3 or not username.isalnum():               # валидация логина
-        return jsonify({"error": "Логин: минимум 3 символа, только латинские буквы и цифры"}), 400
+    if not login_ok(username):                                    # валидация логина
+        return jsonify({"error": "Логин: минимум 3 символа, только латинские буквы, цифры и _"}), 400
     if len(password) < 6:                                         # валидация пароля
         return jsonify({"error": "Пароль: минимум 6 символов"}), 400
     if not (pub and enc_priv and kek_salt):                       # без ключей регистрировать нельзя:
@@ -498,7 +863,10 @@ def api_register():
         save_db()                                                 # сохраняем базу
     token = new_token()                                           # токен сессии
     TOKENS[token] = username                                      # запоминаем
+    TOKEN_DEVICE[token] = (username, remember_device(username, data.get("device")))   # запоминаем устройство входа
     print(f"[GeoMetric] Зарегистрирован новый пользователь: {username}")   # в лог пишем ТОЛЬКО логин
+    system_notice(username, "Добро пожаловать в GeoMetric! Здесь будут системные уведомления: "
+                            "новые входы в аккаунт, смена логина и пароля, ответы на жалобы.")   # приветствие
     return jsonify({"token": token, "me": me_payload(username)})   # отдаём токен и профиль
 
 
@@ -513,6 +881,11 @@ def api_login():
         return jsonify({"error": "Неверный логин или пароль"}), 401
     token = new_token()                                           # новый токен
     TOKENS[token] = username                                      # запоминаем
+    device_id = remember_device(username, data.get("device"))      # запоминаем устройство входа
+    TOKEN_DEVICE[token] = (username, device_id)                   # и привязываем к нему токен
+    device = (u.get("devices") or {}).get(device_id) or {}         # данные этого устройства
+    system_notice(username, f"Выполнен вход в аккаунт: {device.get('platform') or 'устройство'} "
+                            f"({device.get('name') or 'без названия'}). Если это были не вы — смените пароль.")   # предупреждаем
     return jsonify({
         "token": token,                                           # токен для последующих запросов
         "me": me_payload(username),                               # мой профиль
@@ -555,6 +928,8 @@ def api_password():
         DB["users"][username]["kekSalt"] = data["kekSalt"]        # новая соль
         save_db()                                                 # сохраняем
     print(f"[GeoMetric] Пользователь {username} сменил пароль")
+    system_notice(username, "Пароль изменён. Если это были не вы, срочно войдите с новым паролем "
+                            "и отключите лишние устройства в настройках.")   # предупреждаем владельца
     return jsonify({"ok": True})
 
 
@@ -635,6 +1010,18 @@ def api_profile():
                 u["avatar"] = {"kind": "color", "value": str(data["avatar"].get("value", "#7f5af0"))[:16]}
             elif kind == "photo":                                 #   картинка из /uploads
                 u["avatar"] = {"kind": "photo", "value": str(data["avatar"].get("value", ""))[:300]}
+        if "birthday" in data:                                    # день рождения
+            value = str(data["birthday"] or "").strip()[:10]       #   вид 2026-09-25 (пустая строка — не указан)
+            u["birthday"] = value if (not value or len(value) == 10) else u.get("birthday", "")   # принимаем только полную дату
+        if "pinned" in data:                                      # закреплённый личный канал
+            room_id = str(data["pinned"] or "")                    #   ID канала (пустая строка — снять закрепление)
+            room = (DB.get("rooms") or {}).get(room_id)            #   сама комната
+            if not room_id:                                        #   снимаем закрепление —
+                u["pinned"] = ""                                   #     просто чистим
+            elif room and room.get("type") == "channel" and room_role(room, username) in ("owner", "admin"):   # закрепить можно только свой канал
+                u["pinned"] = room_id                              #     запоминаем
+            else:                                                  #   чужой канал или не канал —
+                return jsonify({"error": "Закрепить можно только свой канал"}), 403   #     отказываем
         if "settings" in data and isinstance(data["settings"], dict):   # настройки
             s = u.setdefault("settings", dict(DEFAULT_SETTINGS))        #   текущие настройки
             for key in DEFAULT_SETTINGS.keys():                         #   принимаем только известные ключи
@@ -674,9 +1061,19 @@ def api_history():
     if not username:                                              # нет доступа
         return jsonify({"error": "unauthorized"}), 401
     other = request.args.get("with", "")                          # с кем переписка
-    cid = chat_id(username, other)                                # ID чата
-    msgs = DB["chats"].get(cid, {}).get("messages", [])           # сообщения
-    return jsonify({"messages": msgs[-800:], "chat": cid, "peer": public_user(other, username)})
+    secret = (request.args.get("secret") or "") == "1"            # просят секретный чат?
+    cid = secret_chat_id(username, other) if secret else chat_id(username, other)   # ID чата
+    peer = public_user(other, username) or {}                     # карточка собеседника
+    msgs = [] if peer.get("blocked") else visible_messages(cid, username, 800)   # если он меня заблокировал — истории нет
+    meta = (DB["chats"].get(cid) or {}).get("meta") or {}         # настройки чата
+    return jsonify({
+        "messages": msgs,                                         # видимые мне сообщения
+        "chat": cid,                                              # ID чата
+        "secret": secret,                                         # это секретный чат?
+        "peer": peer,                                             # карточка собеседника
+        "wallpaper": (meta.get("wallpaper_me", {}) or {}).get(username) or meta.get("wallpaper"),   # обои
+        "muted": bool((meta.get("muted", {}) or {}).get(username)),   # «без звука»
+    })
 
 
 @app.get("/api/stories")
@@ -698,8 +1095,1034 @@ def api_my_stories():
 
 
 # ---------------------------------------------------------------------------
+# 7-Б. БОТЫ: свои боты на Python и служебный Стикер-бот
+# ---------------------------------------------------------------------------
+def bot_token_new():                                          # выпустить новый токен бота
+    """Новый токен бота. Показывается владельцу один раз — в базе лежит только его хеш."""
+    return BOT_TOKEN_PREFIX + secrets.token_urlsafe(32)       # длинная случайная строка с узнаваемым началом
+
+
+def bot_token_hash(token):                                    # хеш токена бота
+    """Хеш токена: сам токен в базе не храним — если базу украдут, ботами не смогут управлять."""
+    return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()   # SHA-256 от строки токена
+
+
+def find_bot_by_token(token):                                 # найти бота по его токену
+    """Возвращает логин бота по токену или None, если токен не подходит."""
+    if not (token or "").startswith(BOT_TOKEN_PREFIX):        # токены ботов начинаются с «gm-» —
+        return None                                           #   чужой или пустой токен не подходит
+    h = bot_token_hash(token)                                 # считаем хеш присланного токена
+    for uname, u in DB["users"].items():                      # перебираем всех, кто есть в базе
+        if u.get("is_bot") and u.get("botTokenHash") == h:    # нашли бота с таким токеном
+            return uname                                      #   отдаём его логин
+    return None                                               # ничего не нашли
+
+
+def actor_from_request():                                     # кто выполняет запрос: человек или бот
+    """Определяет «действующее лицо» запроса: обычный пользователь по токену сессии или бот по его токену."""
+    data = request.get_json(silent=True) or {}                # данные из тела запроса
+    token = (data.get("token") or request.form.get("token") or request.args.get("token") or "").strip()   # токен из любого места
+    if token.startswith(BOT_TOKEN_PREFIX):                    # если прислали токен бота —
+        bot = find_bot_by_token(token)                        #   ищем такого бота
+        return (bot, True) if bot else (None, True)           #   и сообщаем, что это бот
+    return user_by_token(token), False                        # иначе — обычная проверка сессии
+
+
+def bot_record(username, owner, name, about):                 # запись нового бота в базе
+    """Создаёт запись бота: это обычный аккаунт с пометкой «бот» и без личных ключей шифрования."""
+    palette = ["#7f5af0", "#2cb67d", "#ff8c42", "#e53170", "#00b8d9", "#8a5cf6", "#f4a261", "#4cc9f0"]   # палитра аватаров
+    return {                                                  # сама запись
+        "username": username,                                 # логин бота (по нему его находят в поиске)
+        "name": name,                                         # отображаемое имя
+        "bio": (about or "")[:BOT_ABOUT_MAX],                 # описание (что умеет бот)
+        "avatar": {"kind": "color", "value": palette[len(username) % len(palette)]},   # аватар-цвет
+        "password": hash_password(secrets.token_urlsafe(24)),  # случайный пароль: человек в такой аккаунт не войдёт
+        "pub": None,                                          # у ботов нет ключей шифрования:
+        "encPriv": None,                                      #   переписка с ботом не может быть сквозной
+        "kekSalt": None,                                      #   (бот сам читает сообщения — как в любом мессенджере)
+        "settings": dict(DEFAULT_SETTINGS),                   # обычные настройки
+        "created": time.time(),                               # когда создан
+        "online": False,                                      # сейчас не в сети
+        "last_seen": time.time(),                             # время последней активности
+        "is_bot": True,                                       # пометка «это бот»
+        "owner": owner,                                       # кто владелец (логин человека)
+        "devices": {},                                        # устройства (у ботов бывают свои)
+    }
+
+
+def bot_card(username):                                       # карточка бота для интерфейса
+    """Краткая карточка бота: без служебных полей и без токена."""
+    u = DB["users"].get(username) or {}                       # запись бота
+    return {
+        "username": username,                                 # логин
+        "name": u.get("name") or username,                    # имя
+        "about": u.get("bio") or "",                          # описание
+        "owner": u.get("owner"),                              # владелец (кто создал)
+        "created": u.get("created", 0),                       # когда создан
+        "avatar": u.get("avatar") or {"kind": "color", "value": "#6c5cff"},   # аватар
+        "bot": True,                                          # пометка для интерфейса
+    }
+
+
+@app.post("/api/bots")
+def api_bot_create():
+    """Создать своего бота. В ответ один раз приходит токен — по нему запускается программа бота."""
+    username, _ = actor_from_request()                        # проверяем, кто просит
+    if not username:                                          # не авторизован
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}                # данные запроса
+    bot_login = (data.get("username") or "").strip().lower()  # желаемый логин бота
+    name = (data.get("name") or bot_login).strip()[:40]       # имя бота
+    about = (data.get("about") or "").strip()                 # описание
+    if len(bot_login) < 3 or not bot_login.isalnum():         # проверяем логин
+        return jsonify({"error": "Логин бота: минимум 3 символа, только латиница и цифры"}), 400
+    mine = [u for u in DB["users"].values() if u.get("owner") == username]   # сколько ботов уже создал человек
+    if len(mine) >= BOT_LIMIT:                                # слишком много —
+        return jsonify({"error": f"Можно создать не больше {BOT_LIMIT} ботов"}), 400
+    token = bot_token_new()                                   # выпускаем токен
+    with DB_LOCK:                                             # меняем базу под замком
+        if bot_login in DB["users"]:                          # логин занят
+            return jsonify({"error": "Этот логин уже занят"}), 409
+        DB["users"][bot_login] = bot_record(bot_login, username, name, about)   # создаём бота
+        DB["users"][bot_login]["botTokenHash"] = bot_token_hash(token)          # кладём только хеш токена
+        save_db()                                             # сохраняем
+    print(f"[GeoMetric] Создан бот @{bot_login} (владелец {username})")   # пишем в лог
+    return jsonify({"bot": bot_card(bot_login), "token": token})   # токен показываем один раз
+
+
+@app.get("/api/bots")
+def api_bots_list():
+    """Список моих ботов (без токенов)."""
+    username = user_by_token(request.args.get("token"))       # проверяем токен
+    if not username:                                          # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    out = [bot_card(u) for u, rec in DB["users"].items() if rec.get("owner") == username]   # собираем своих ботов
+    out.sort(key=lambda b: b.get("created", 0))               # старые — первыми
+    return jsonify({"bots": out})                             # отдаём список
+
+
+@app.post("/api/bots/token")
+def api_bot_new_token():
+    """Выпустить новый токен для бота (старый перестанет работать)."""
+    username = user_by_token((request.get_json(silent=True) or {}).get("token"))   # проверяем владельца
+    if not username:                                          # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    bot_login = ((request.get_json(silent=True) or {}).get("bot") or "").strip().lower()   # логин бота
+    u = DB["users"].get(bot_login) or {}                      # запись бота
+    if u.get("owner") != username:                            # это не мой бот
+        return jsonify({"error": "Это не ваш бот"}), 403
+    token = bot_token_new()                                   # новый токен
+    with DB_LOCK:                                             # меняем базу под замком
+        u["botTokenHash"] = bot_token_hash(token)             # заменяем хеш токена
+        save_db()                                             # сохраняем
+    return jsonify({"token": token})                          # показываем один раз
+
+
+@app.post("/api/bots/delete")
+def api_bot_delete():
+    """Удалить бота вместе с его переписками."""
+    data = request.get_json(silent=True) or {}                # данные запроса
+    owner = user_by_token(data.get("token"))                  # проверяем владельца
+    if not owner:                                             # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    bot_login = (data.get("bot") or "").strip().lower()       # логин бота
+    u = DB["users"].get(bot_login) or {}                      # запись бота
+    if u.get("owner") != owner:                               # это не мой бот
+        return jsonify({"error": "Это не ваш бот"}), 403
+    with DB_LOCK:                                             # меняем базу под замком
+        DB["users"].pop(bot_login, None)                      # убираем аккаунт бота
+        for cid in [c for c in DB["chats"] if bot_login in c.split("|")]:   # находим все его переписки
+            DB["chats"].pop(cid, None)                        #   и убираем их
+        for pack_id, pack in list(DB.get("packs", {}).items()):   # ещё убираем наборы стикеров бота
+            if pack.get("owner") == bot_login:                #   если набор принадлежал боту
+                DB["packs"].pop(pack_id, None)                #   удаляем
+        save_db()                                             # сохраняем
+    return jsonify({"ok": True})                              # готово
+
+
+@app.post("/api/bot/send")
+def api_bot_send():
+    """Отправка сообщения от имени бота. Нужна ботам на Python: им удобнее писать по HTTP, чем через сокет."""
+    data = request.get_json(silent=True) or {}                 # данные запроса
+    who = find_bot_by_token(data.get("token")) or user_by_token(data.get("token"))   # кто отправляет: бот или человек
+    if not who:                                                # не авторизован
+        return jsonify({"error": "unauthorized"}), 401
+    to = (data.get("to") or "").strip()                        # получатель (логин человека или бота)
+    room = (data.get("room") or "").strip()                    # или комната (группа/канал)
+    kind = data.get("kind") or "text"                          # вид сообщения
+    if kind not in ("text", "media", "sticker", "voice", "circle"):   # поддерживаемые виды
+        return jsonify({"error": "Неизвестный вид сообщения"}), 400   # отказываем
+    plain = data.get("plain") or {}                            # открытая часть (боты не шифруют: они читают текст сами)
+    if not plain:                                              # пустое сообщение —
+        return jsonify({"error": "Пустое сообщение"}), 400     #   отправлять нечего
+    if room and room not in DB["rooms"]:                       # указана комната, которой нет
+        return jsonify({"error": "Комната не найдена"}), 404   #   сообщаем
+    if not room and to not in DB["users"]:                     # получателя нет
+        return jsonify({"error": "Получатель не найден"}), 404   #   сообщаем
+    cid = room if room else chat_id(who, to)                   # куда пишем: комната или личный чат
+    msg = {                                                    # готовим сообщение
+        "id": uuid.uuid4().hex,                                # уникальный ID
+        "chat": cid,                                           # чат (личный) — для комнат используется отдельная запись
+        "room": room or None,                                  # комната, если писали в неё
+        "from": who,                                           # отправитель (бот)
+        "to": to or room,                                      # получатель
+        "kind": kind,                                          # вид сообщения
+        "e2e": None,                                           # боты не шифруют переписку
+        "plain": plain,                                        # открытые данные
+        "call": None,                                          # это не звонок
+        "ts": time.time(),                                     # время отправки
+        "read": False,                                         # пока не прочитано
+    }
+    with DB_LOCK:                                              # меняем базу под замком
+        if room:                                               # писали в комнату —
+            DB["rooms"][room].setdefault("messages", []).append(msg)   #   добавляем в комнату
+        else:                                                  # писали человеку —
+            get_chat(cid)["messages"].append(msg)              #   добавляем в личную переписку
+        DB["users"][who]["last_seen"] = msg["ts"]              # отмечаем активность бота
+        save_db()                                              # сохраняем
+    if room:                                                   # в комнату —
+        socketio.emit("new_room_message", msg, room=f"room:{room}")   #   всем участникам
+        socketio.emit("room_history_update", {"room": room, "message": msg}, room=f"room:{room}")   #   и обновление истории
+    else:                                                      # личное сообщение —
+        socketio.emit("new_message", msg, room=f"u:{to}")      #   получателю (на все его устройства)
+        socketio.emit("new_message", msg, room=f"u:{who}")     #   и самому боту (для его же связи)
+        socketio.emit("chats_update", {"chats": chat_list_for(to)}, room=f"u:{to}")   # обновляем список чатов
+    return jsonify({"ok": True, "message": msg})               # отдаём отправленное сообщение
+
+
+@app.post("/api/bot/login")
+def api_bot_login():
+    """Вход для программы бота: по токену бота выдаём обычную сессию (дальше как у человека)."""
+    data = request.get_json(silent=True) or {}                # данные запроса
+    bot_login = find_bot_by_token(data.get("bot_token"))      # ищем бота по токену
+    if not bot_login:                                         # токен неверный
+        return jsonify({"error": "Неверный токен бота"}), 401
+    token = new_token()                                       # сессия для бота
+    TOKENS[token] = bot_login                                 # запоминаем
+    TOKEN_DEVICE[token] = (bot_login, remember_device(bot_login, {
+        "id": f"bot:{bot_login}",                             # устройство бота помечаем отдельно
+        "name": (data.get("device") or {}).get("name") or "Сервер бота",   # где запущена программа бота
+        "platform": (data.get("device") or {}).get("platform") or "Python",   # например «Python»
+    }))
+    with DB_LOCK:                                             # отмечаем бота «в сети»
+        DB["users"][bot_login]["online"] = True               # флаг «в сети»
+        DB["users"][bot_login]["last_seen"] = time.time()     # время активности
+        save_db()                                             # сохраняем
+    return jsonify({"token": token, "me": me_payload(bot_login)})   # отдаём сессию и профиль
+
+
+# ---------------------------------------------------------------------------
+# 7-В. УСТРОЙСТВА: список входов и выход с чужого устройства
+# ---------------------------------------------------------------------------
+@app.get("/api/devices")
+def api_devices():
+    """Список устройств, с которых входили в аккаунт."""
+    data = request.args                                          # параметры запроса
+    username = user_by_token(data.get("token"))                  # проверяем токен
+    if not username:                                             # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    current = (TOKEN_DEVICE.get(data.get("token")) or (username, None))[1]   # текущее устройство
+    return jsonify({"devices": devices_payload(username, current)})   # отдаём список
+
+
+@app.post("/api/devices/revoke")
+def api_devices_revoke():
+    """Выйти с другого устройства: его сессии перестают работать."""
+    data = request.get_json(silent=True) or {}                   # данные запроса
+    username = user_by_token(data.get("token"))                  # проверяем токен
+    if not username:                                             # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    device = str(data.get("device") or "")                       # какое устройство закрываем
+    if not device:                                               # не указали —
+        return jsonify({"error": "Не указано устройство"}), 400
+    mine = (TOKEN_DEVICE.get(data.get("token")) or (username, None))[1]   # текущее устройство
+    drop_device(username, device)                                # гасим устройство и его сессии
+    return jsonify({"ok": True, "logged_out_me": device == mine})   # сообщаем, не своё ли устройство закрыли
+
+
+# ---------------------------------------------------------------------------
+# 7-Г. СТИКЕРЫ: наборы, добавление картинок и установка наборов
+# ---------------------------------------------------------------------------
+STICKER_BOT_USER = "stickers"                                 # логин служебного Стикер-бота (по нему к нему пишут)
+EMOJI_DEFAULT = "🙂"                                          # значок по умолчанию, если человек его не указал
+
+
+def pack_card(pack):                                          # краткая карточка набора (для списков)
+    """Карточка набора стикеров: название, владелец и «обложка» — первый стикер."""
+    stickers = pack.get("stickers") or []                     # стикеры набора
+    return {
+        "id": pack.get("id"),                                 # идентификатор набора
+        "title": pack.get("title") or "Набор",                # название
+        "short": pack.get("short") or "",                     # короткое имя (для ссылки)
+        "owner": pack.get("owner"),                           # кто владелец
+        "count": len(stickers),                               # сколько стикеров внутри
+        "cover": (stickers[0] or {}).get("url") if stickers else "",   # обложка (первый стикер)
+        "created": pack.get("created", 0),                    # когда создан
+    }
+
+
+def create_pack(owner, title, short=""):                      # создать набор стикеров
+    """Создаёт пустой набор стикеров. owner — логин человека или бота."""
+    pid = uuid.uuid4().hex[:12]                               # короткий идентификатор набора
+    pack = {                                                  # сама запись набора
+        "id": pid,                                            # идентификатор
+        "title": (title or "Мой набор").strip()[:40],          # название
+        "short": (short or "").strip().lower()[:24],          # короткое имя
+        "owner": owner,                                       # владелец
+        "stickers": [],                                       # пока пустой
+        "created": time.time(),                               # когда создан
+    }
+    with DB_LOCK:                                             # меняем базу под замком
+        DB.setdefault("packs", {})[pid] = pack                 # кладём набор
+        u = DB["users"].get(owner)                            # владелец
+        if u is not None:                                     # если он существует —
+            u.setdefault("installedPacks", [])                 #   заводим список установленных наборов
+            if pid not in u["installedPacks"]:                #   набор сразу доступен владельцу
+                u["installedPacks"].append(pid)               #   добавляем
+        save_db()                                             # сохраняем
+    return pack                                               # отдаём набор
+
+
+def add_sticker_to_pack(pack_id, url, emoji=""):               # положить картинку в набор
+    """Добавляет стикер в набор. Возвращает стикер или None, если набор переполнен/не найден."""
+    with DB_LOCK:                                             # меняем базу под замком
+        pack = (DB.get("packs") or {}).get(pack_id)            # ищем набор
+        if not pack:                                          # набора нет —
+            return None                                       #   выходим
+        if len(pack["stickers"]) >= STICKER_LIMIT:             # набор уже полный —
+            return None                                       #   выходим
+        sticker = {                                           # сама запись стикера
+            "id": uuid.uuid4().hex[:10],                       # идентификатор
+            "url": url,                                       # адрес картинки на сервере
+            "emoji": (emoji or EMOJI_DEFAULT)[:8],            # значок для подбора
+            "ts": time.time(),                                # когда добавлен
+        }
+        pack["stickers"].append(sticker)                       # добавляем в набор
+        save_db()                                             # сохраняем
+    return sticker                                            # отдаём добавленный стикер
+
+
+def packs_payload(username):                                  # наборы для интерфейса
+    """Возвращает мои наборы и установленные наборы (с обложками)."""
+    u = DB["users"].get(username) or {}                        # запись человека
+    all_packs = DB.get("packs") or {}                          # все наборы в базе
+    mine = [pack_card(p) for p in all_packs.values() if p.get("owner") == username]   # созданные мной
+    installed = [pack_card(all_packs[pid]) for pid in (u.get("installedPacks") or []) if pid in all_packs]   # установленные
+    installed = [p for p in installed if p.get("owner") != username]   # свои отдельно — не дублируем
+    mine.sort(key=lambda p: p.get("created", 0))              # свои — по порядку создания
+    installed.sort(key=lambda p: p.get("title", ""))          # чужие — по названию
+    return {"mine": mine, "installed": installed}             # отдаём оба списка
+
+
+def bot_say(bot_login, to, text):                             # сообщение от имени бота
+    """Пишет человеку от имени бота. Сообщения ботов не шифруются — бот сам их читает."""
+    cid = chat_id(bot_login, to)                               # идентификатор переписки
+    msg = {                                                    # готовим сообщение
+        "id": uuid.uuid4().hex,                                # уникальный ID
+        "chat": cid,                                           # чат
+        "from": bot_login,                                     # отправитель — бот
+        "to": to,                                              # получатель — человек
+        "kind": "text",                                        # это текст
+        "e2e": None,                                           # шифрования нет: бот обязан читать текст
+        "plain": {"text": text, "file": None},                 # открытый текст
+        "call": None,                                          # это не звонок
+        "ts": time.time(),                                     # время
+        "read": False,                                         # пока не прочитано
+    }
+    with DB_LOCK:                                              # меняем базу под замком
+        get_chat(cid)["messages"].append(msg)                  # дописываем в переписку
+        DB["users"][bot_login]["last_seen"] = msg["ts"]        # обновляем активность бота
+        save_db()                                              # сохраняем
+    socketio.emit("new_message", msg, room=f"u:{to}")          # отправляем человеку
+    socketio.emit("new_message", msg, room=f"u:{bot_login}")   # и в комнату бота (для его программ)
+    socketio.emit("chats_update", {"chats": chat_list_for(to)}, room=f"u:{to}")   # обновляем список чатов
+    return msg                                                 # отдаём сообщение
+
+
+def ensure_sticker_bot():                                      # создать служебного Стикер-бота
+    """Создаёт аккаунт Стикер-бота при первом запуске сервера, если его ещё нет."""
+    with DB_LOCK:                                              # меняем базу под замком
+        if STICKER_BOT_USER in DB["users"]:                    # бот уже есть —
+            return                                             #   ничего не делаем
+        rec = bot_record(STICKER_BOT_USER, None, "Стикер-бот",  # создаём запись бота
+                         "Создаю наборы стикеров: пришлите фото — получите стикер.")
+        rec["botTokenHash"] = bot_token_hash(bot_token_new())   # токена у служебного бота нет ни у кого
+        DB["users"][STICKER_BOT_USER] = rec                     # кладём в базу
+        save_db()                                              # сохраняем
+        print("[GeoMetric] Создан служебный аккаунт: Стикер-бот")   # сообщаем в лог
+
+
+STICKER_BOT_HELP = (                                           # текст справки Стикер-бота
+    "Привет! Я делаю наборы стикеров.\n\n"
+    "/newpack Название — создать новый набор\n"
+    "потом просто присылайте картинки — каждая станет стикером\n"
+    "/done — закончить и установить набор\n"
+    "/mypacks — мои наборы\n"
+    "/delpack идентификатор — удалить набор"
+)
+
+
+def sticker_bot_handle(username, text, media):                 # логика Стикер-бота
+    """Разбирает сообщение Стикер-боту: команды и картинки. Отвечает от имени бота."""
+    t = (text or "").strip()                                   # текст сообщения
+    low = t.lower()                                            # в нижнем регистре — удобно сравнивать команды
+    state = BOT_STATE.get(username) or {}                      # что этот человек делает прямо сейчас
+    pack_id = state.get("pack")                                # набор, в который добавляем стикеры
+    if low.startswith("/newpack") or low.startswith("/new"):    # создать набор
+        title = t.split(" ", 1)[1].strip() if " " in t else ""   # название из команды
+        if not title:                                          # название не указали —
+            bot_say(STICKER_BOT_USER, username, "Напишите так: /newpack Название набора")   # подсказываем
+            return                                             # и выходим
+        pack = create_pack(username, title)                    # создаём набор
+        BOT_STATE[username] = {"pack": pack["id"]}             # запоминаем, куда добавлять стикеры
+        bot_say(STICKER_BOT_USER, username,                    # отвечаем
+                f"Набор «{pack['title']}» создан. Присылайте картинки — каждая станет стикером.\n"
+                "Когда закончите — /done")
+        socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем наборы в приложении
+        return                                                 # готово
+    if media and media.get("url"):                             # прислали картинку
+        if not pack_id:                                        # набора ещё нет —
+            bot_say(STICKER_BOT_USER, username, "Сначала создайте набор: /newpack Название")   # подсказываем
+            return                                             # и выходим
+        sticker = add_sticker_to_pack(pack_id, media["url"], media.get("emoji") or "")   # добавляем стикер
+        if not sticker:                                        # не получилось (переполнен или удалён)
+            bot_say(STICKER_BOT_USER, username, f"Не получилось добавить: набор удалён или в нём уже {STICKER_LIMIT} стикеров.")
+            return                                             # выходим
+        count = len((DB["packs"].get(pack_id) or {}).get("stickers") or [])   # сколько стикеров стало
+        bot_say(STICKER_BOT_USER, username, f"Стикер добавлен. Всего в наборе: {count}.")   # подтверждаем
+        socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем наборы
+        return                                                 # готово
+    if low.startswith("/done"):                                # закончить набор
+        if not pack_id:                                        # набора нет —
+            bot_say(STICKER_BOT_USER, username, "Набор ещё не создан. Начните с /newpack Название")   # подсказываем
+            return                                             # и выходим
+        pack = DB["packs"].get(pack_id) or {}                  # берём набор
+        BOT_STATE.pop(username, None)                          # забываем состояние
+        bot_say(STICKER_BOT_USER, username,                    # отвечаем
+                f"Готово! Набор «{pack.get('title')}» из {len(pack.get('stickers') or [])} стикеров установлен.\n"
+                "Откройте панель стикеров в любом чате — набор уже там.")
+        socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем наборы
+        return                                                 # готово
+    if low.startswith("/mypacks"):                             # список моих наборов
+        mine = [p for p in (DB.get("packs") or {}).values() if p.get("owner") == username]   # наборы человека
+        if not mine:                                           # пусто —
+            bot_say(STICKER_BOT_USER, username, "У вас пока нет наборов. Создайте: /newpack Название")   # подсказываем
+            return                                             # и выходим
+        lines = [f"• {p['title']} — {len(p.get('stickers') or [])} шт., id {p['id']}" for p in mine]   # строки списка
+        bot_say(STICKER_BOT_USER, username, "Ваши наборы:\n" + "\n".join(lines))   # отправляем список
+        return                                                 # готово
+    if low.startswith("/delpack"):                             # удалить набор
+        target = t.split(" ", 1)[1].strip() if " " in t else ""   # идентификатор из команды
+        pack = (DB.get("packs") or {}).get(target) or {}        # ищем набор
+        if pack.get("owner") != username:                       # не его набор —
+            bot_say(STICKER_BOT_USER, username, "Не нашёл такой набор. Посмотрите список: /mypacks")
+            return                                             # и выходим
+        with DB_LOCK:                                           # меняем базу под замком
+            DB["packs"].pop(target, None)                       # удаляем набор
+            for u in DB["users"].values():                      # у всех, кто его установил,
+                if target in (u.get("installedPacks") or []):   #   убираем из установленных
+                    u["installedPacks"].remove(target)          #   чтобы не осталось пустых ссылок
+            save_db()                                           # сохраняем
+        BOT_STATE.pop(username, None)                           # сбрасываем состояние
+        bot_say(STICKER_BOT_USER, username, "Набор удалён.")     # подтверждаем
+        socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем наборы
+        return                                                 # готово
+    bot_say(STICKER_BOT_USER, username, STICKER_BOT_HELP)       # не поняли — показываем справку
+
+
+@app.get("/api/stickers/packs")
+def api_sticker_packs():
+    """Наборы стикеров: мои собственные и установленные."""
+    username = user_by_token(request.args.get("token"))        # проверяем токен
+    if not username:                                           # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(packs_payload(username))                    # отдаём наборы
+
+
+@app.get("/api/stickers/pack/<pack_id>")
+def api_sticker_pack(pack_id):
+    """Полный набор стикеров вместе со всеми картинками."""
+    username = user_by_token(request.args.get("token"))        # проверяем токен
+    if not username:                                           # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    pack = (DB.get("packs") or {}).get(pack_id)                # ищем набор
+    if not pack:                                               # нет такого —
+        return jsonify({"error": "Набор не найден"}), 404      #   сообщаем
+    return jsonify({"pack": pack})                             # отдаём набор целиком
+
+
+@app.post("/api/stickers/pack")
+def api_sticker_pack_create():
+    """Создать набор стикеров (из приложения — кнопкой, без команд боту)."""
+    actor, _is_bot = actor_from_request()                      # кто просит: человек или бот
+    if not actor:                                              # не авторизован
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}                 # данные запроса
+    title = (data.get("title") or "").strip()                  # название набора
+    if not title:                                              # название пустое —
+        return jsonify({"error": "Укажите название набора"}), 400   #   просим указать
+    mine = [p for p in (DB.get("packs") or {}).values() if p.get("owner") == actor]   # сколько наборов уже создано
+    if len(mine) >= PACKS_PER_USER:                            # слишком много —
+        return jsonify({"error": f"Можно создать не больше {PACKS_PER_USER} наборов"}), 400
+    pack = create_pack(actor, title, data.get("short") or "")   # создаём набор
+    socketio.emit("stickers_update", packs_payload(actor), room=f"u:{actor}")   # обновляем список в приложении
+    return jsonify({"pack": pack_card(pack)})                  # отдаём карточку набора
+
+
+@app.post("/api/stickers/add")
+def api_sticker_add():
+    """Добавить стикер в набор. Картинка идёт как есть: стикеры публичные, шифровать их не нужно."""
+    actor, _is_bot = actor_from_request()                      # кто просит
+    if not actor:                                              # не авторизован
+        return jsonify({"error": "unauthorized"}), 401
+    pack_id = (request.form.get("pack") or "").strip()         # в какой набор добавляем
+    file = request.files.get("file")                           # сама картинка
+    emoji = (request.form.get("emoji") or "").strip()          # значок (необязательно)
+    pack = (DB.get("packs") or {}).get(pack_id) or {}          # ищем набор
+    if pack.get("owner") != actor:                             # чужой набор менять нельзя
+        return jsonify({"error": "Это не ваш набор"}), 403
+    if not file or not file.filename:                           # картинку не прислали
+        return jsonify({"error": "Файл не передан"}), 400
+    data = file.read()                                         # читаем картинку в память
+    if len(data) > STICKER_MAX_BYTES:                           # слишком большой файл —
+        return jsonify({"error": f"Стикер должен быть не больше {STICKER_MAX_BYTES // 1024} КБ"}), 400
+    ext = Path(file.filename).suffix.lower() or ".png"          # расширение (png/webp/jpg)
+    fname = f"sticker_{uuid.uuid4().hex[:12]}{ext[:6]}"         # имя файла на сервере
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)               # на всякий случай создаём папку загрузок
+    (UPLOAD_DIR / fname).write_bytes(data)                      # сохраняем картинку
+    sticker = add_sticker_to_pack(pack_id, f"/uploads/{fname}", emoji)   # добавляем стикер в набор
+    if not sticker:                                            # не получилось
+        return jsonify({"error": f"В наборе уже {STICKER_LIMIT} стикеров или он удалён"}), 400
+    owner = pack.get("owner")                                  # владелец набора
+    if owner:                                                  # если владелец известен —
+        socketio.emit("stickers_update", packs_payload(owner), room=f"u:{owner}")   # обновляем его список
+    return jsonify({"sticker": sticker, "pack": pack_card(pack)})   # отдаём стикер и обновлённую карточку
+
+
+@app.post("/api/stickers/install")
+def api_sticker_install():
+    """Установить чужой набор себе (или убрать его — по параметру remove)."""
+    data = request.get_json(silent=True) or {}                 # данные запроса
+    username = user_by_token(data.get("token"))                # проверяем токен
+    if not username:                                           # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    pack_id = (data.get("pack") or "").strip()                 # какой набор
+    remove = bool(data.get("remove"))                          # убрать вместо установки?
+    if pack_id not in (DB.get("packs") or {}):                 # набора нет —
+        return jsonify({"error": "Набор не найден"}), 404      #   сообщаем
+    with DB_LOCK:                                              # меняем базу под замком
+        u = DB["users"][username]                              # запись человека
+        installed = u.setdefault("installedPacks", [])          # список установленных наборов
+        if remove and pack_id in installed:                    # убираем —
+            installed.remove(pack_id)                          #   вычёркиваем
+        elif not remove and pack_id not in installed:          # ставим —
+            installed.append(pack_id)                          #   добавляем
+        save_db()                                              # сохраняем
+    return jsonify(packs_payload(username))                    # отдаём свежие списки
+
+
+@app.post("/api/stickers/remove")
+def api_sticker_remove():
+    """Удалить один стикер из набора."""
+    data = request.get_json(silent=True) or {}                 # данные запроса
+    username = user_by_token(data.get("token"))                # проверяем токен
+    if not username:                                           # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    pack = (DB.get("packs") or {}).get((data.get("pack") or "").strip()) or {}   # ищем набор
+    if pack.get("owner") != username:                          # не его набор
+        return jsonify({"error": "Это не ваш набор"}), 403
+    with DB_LOCK:                                              # меняем базу под замком
+        pack["stickers"] = [st for st in pack.get("stickers") or [] if st.get("id") != data.get("sticker")]   # выкидываем стикер
+        save_db()                                              # сохраняем
+    socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем в приложении
+    return jsonify({"pack": pack_card(pack)})                  # отдаём обновлённую карточку
+
+
+@app.post("/api/stickers/delete_pack")
+def api_sticker_delete_pack():
+    """Удалить набор целиком."""
+    data = request.get_json(silent=True) or {}                 # данные запроса
+    username = user_by_token(data.get("token"))                # проверяем токен
+    if not username:                                           # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    pack_id = (data.get("pack") or "").strip()                 # какой набор удаляем
+    pack = (DB.get("packs") or {}).get(pack_id) or {}          # ищем набор
+    if pack.get("owner") != username:                          # не его набор
+        return jsonify({"error": "Это не ваш набор"}), 403
+    with DB_LOCK:                                              # меняем базу под замком
+        DB["packs"].pop(pack_id, None)                         # удаляем набор
+        for u in DB["users"].values():                         # у всех, кто его поставил,
+            if pack_id in (u.get("installedPacks") or []):     #   убираем из установленных
+                u["installedPacks"].remove(pack_id)            #   чтобы не осталось пустых ссылок
+        save_db()                                              # сохраняем
+    socketio.emit("stickers_update", packs_payload(username), room=f"u:{username}")   # обновляем
+    return jsonify({"ok": True})                               # готово
+
+
+# ---------------------------------------------------------------------------
 # 8. СОБЫТИЯ В РЕАЛЬНОМ ВРЕМЕНИ
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+#  6-Б. НОВЫЕ ВОЗМОЖНОСТИ ЧАТОВ (удаление, очистка, обои, поиск, блокировка)
+# ---------------------------------------------------------------------------
+def rename_user(old: str, new: str) -> bool:
+    """Меняет логин человека везде: в профиле, чатах, комнатах, ботах и жалобах.
+
+    Логин — это ключ ко всем данным, поэтому при смене его надо аккуратно перенести,
+    иначе человек «потеряет» свои переписки.
+    """
+    if new in DB["users"] or old not in DB["users"]:              # новый логин занят или старого нет —
+        return False                                              #   менять нельзя
+    with DB_LOCK:                                                 # меняем базу под замком
+        DB["users"][new] = DB["users"].pop(old)                   # переносим запись профиля
+        DB["users"][new]["username"] = new                        # и поле логина внутри неё
+        for cid in list(DB["chats"].keys()):                      # теперь переименовываем чаты
+            if old not in cid.split("|"):                         # этот чат не его —
+                continue                                          #   пропускаем
+            parts = cid.split("|")                                # разбираем ID на части
+            replaced = "|".join(new if part == old else part for part in parts)   # заменяем логин
+            chat = DB["chats"].pop(cid)                           # забираем чат из старого ключа
+            target = DB["chats"].get(replaced)                    # есть ли уже чат под новым ключом?
+            if target:                                            # если есть —
+                target["messages"].extend(chat.get("messages", []))   #   дописываем сообщения туда
+                target["messages"].sort(key=lambda m: m.get("ts", 0))  #   и сортируем по времени
+            else:                                                 # иначе —
+                DB["chats"][replaced] = chat                      #   кладём под новым ключом
+            for m in (DB["chats"].get(replaced) or {}).get("messages", []):   # у сообщений
+                if m.get("from") == old:                          #   меняем отправителя
+                    m["from"] = new                               #   на новый логин
+                if m.get("to") == old:                            #   и получателя
+                    m["to"] = new                                 #   тоже
+                m["chat"] = replaced                              #   и ID чата
+            for key, value in (chat.get("meta") or {}).items():   # переносим настройки чата
+                if isinstance(value, dict):                       # словари вида «логин → значение»
+                    got = (DB["chats"].get(replaced) or {}).setdefault("meta", {}).setdefault(key, {})   # где менять
+                    if old in value:                              # если там есть старый логин —
+                        value[new] = value.pop(old)               #   переносим значение
+                    if isinstance(got, dict):                     # и в целевом чате —
+                        got.update({k: v for k, v in value.items() if k == new})   #   переносим ключ
+        for room in (DB.get("rooms") or {}).values():             # теперь комнаты
+            members = room.get("members") or {}                   # участники
+            if old in members:                                    # он участник —
+                members[new] = members.pop(old)                   #   переносим запись участника
+            if room.get("owner") == old:                          # был владельцем —
+                room["owner"] = new                               #   становится владельцем под новым логином
+            for key, value in list((room.get("keys") or {}).items()):   # ключи комнаты
+                if key == old:                                    # выдан старому логину —
+                    room["keys"][new] = room["keys"].pop(old)     #   переносим
+            for m in room.get("messages", []):                    # и сообщения комнаты
+                if m.get("from") == old:                          #   меняем автора
+                    m["from"] = new                               #   на новый логин
+        for pack in (DB.get("packs") or {}).values():             # наборы стикеров
+            if pack.get("owner") == old:                          #   его набор —
+                pack["owner"] = new                               #   меняем владельца
+        for bot in DB["users"].values():                          # своих ботов
+            if bot.get("owner") == old:                           #   которые принадлежали ему —
+                bot["owner"] = new                                #   переносим владельца
+        for story in DB.get("stories", []):                       # истории
+            if story.get("from") == old:                          #   его история —
+                story["from"] = new                               #   меняем автора
+        for rep in DB.get("reports", []):                         # жалобы
+            if rep.get("from") == old:                            #   он жаловался —
+                rep["from"] = new                                 #   меняем автора
+            if rep.get("about") == old:                           #   на него жаловались —
+                rep["about"] = new                                #   меняем «виновника»
+        for tok, name in list(TOKENS.items()):                    # токены сессий
+            if name == old:                                       #   его токен —
+                TOKENS[tok] = new                                 #   привязываем к новому логину
+        for tok, meta in list(TOKEN_DEVICE.items()):              # привязки токенов к устройствам
+            if meta[0] == old:                                    #   его устройство —
+                TOKEN_DEVICE[tok] = (new, meta[1])                #   переносим
+        save_db()                                                 # сохраняем всё разом
+    return True                                                   # сообщаем об успехе
+
+
+def client_device_id(token: str) -> str:
+    """Определяет устройство по токену сессии (нужно, чтобы показать «это устройство»)."""
+    meta = TOKEN_DEVICE.get(token) or (None, None)                # привязка токена к устройству
+    return meta[1] or ""                                          # идентификатор устройства
+
+
+@app.post("/api/username")
+def api_username():
+    """Смена логина (username) после регистрации."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто меняет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    if (DB["users"].get(username) or {}).get("is_bot"):            # боты логин не меняют
+        return jsonify({"error": "Ботам нельзя менять логин"}), 400
+    new = clean_login(data.get("username"))                        # новый логин
+    if not login_ok(new):                                          # проверяем формат
+        return jsonify({"error": "Логин: минимум 3 символа, только латинские буквы, цифры и _"}), 400
+    if new == username:                                            # ничего не изменилось —
+        return jsonify({"me": me_payload(username)})               #   просто отдаём профиль
+    if not rename_user(username, new):                             # занят или не получилось
+        return jsonify({"error": "Этот логин уже занят"}), 409
+    system_notice(new, f"Ваш логин изменён: теперь вы @{new}. Сообщите его друзьям.")   # уведомляем владельца
+    safe_emit("me_updated", {"me": me_payload(new)}, room=f"u:{new}")   # просим приложение обновить профиль
+    safe_emit("chats_update", {"chats": chat_list_for(new)}, room=f"u:{new}")   # и список чатов
+    print(f"[GeoMetric] Логин изменён: {username} → {new}")          # в лог пишем только логины
+    return jsonify({"me": me_payload(new)})                        # отдаём обновлённый профиль
+
+
+@app.post("/api/chat/secret")
+def api_chat_secret():
+    """Создаёт (или открывает) секретный чат с человеком — отдельная переписка с замочком."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто просит
+    other = (data.get("with") or "").strip().lower()               # с кем
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    if other not in DB["users"] or (DB["users"][other] or {}).get("is_bot"):   # человека нет или это бот
+        return jsonify({"error": "Секретный чат возможен только с человеком"}), 400
+    if other == username:                                          # с самим собой —
+        return jsonify({"error": "С собой секретный чат не нужен"}), 400
+    cid = secret_chat_id(username, other)                          # ID секретного чата
+    chat_meta(cid)["secret"] = True                                # помечаем секретным
+    get_chat(cid)                                                  # создаём переписку
+    save_db()                                                      # сохраняем
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем список у себя
+    print(f"[GeoMetric] Открыт секретный чат: {username} и {other}")   # в логе — только факт, без содержимого
+    return jsonify({"chat": cid, "with": other, "secret": True})   # отдаём ID
+
+
+@app.post("/api/chat/clear")
+def api_chat_clear():
+    """Очищает историю чата: у меня или у обоих."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто чистит
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата
+    scope = data.get("scope") or "me"                              # «me» — только у меня, «all» — у обоих
+    if chat not in DB["chats"] and not ensure_dm_chat(chat):       # чата нет и создать не получилось —
+        return jsonify({"error": "Чат не найден"}), 404            #   сообщаем
+    if username not in chat.split("|"):                            # это не мой чат —
+        return jsonify({"error": "Нет доступа"}), 403
+    with DB_LOCK:                                                 # меняем базу
+        if scope == "all":                                        # очистить у обоих разрешено в личной переписке
+            DB["chats"][chat]["messages"] = []                     #   просто убираем сообщения
+            DB["chats"][chat].setdefault("meta", {})["cleared"] = {}   #   сбрасываем отметки очистки
+        else:                                                     # только у себя —
+            meta = chat_meta(chat)                                 #   настройки чата
+            meta["cleared"][username] = time.time()                #   запоминаем время очистки
+        save_db()                                                 # сохраняем
+    for part in chat.split("|"):                                  # всем участникам —
+        if part in DB["users"]:                                   #   кто существует
+            safe_emit("history_cleared", {"chat": chat, "scope": scope}, room=f"u:{part}")   # сообщаем об очистке
+            safe_emit("chats_update", {"chats": chat_list_for(part)}, room=f"u:{part}")      # обновляем список чатов
+    return jsonify({"ok": True})                                  # готово
+
+
+@app.post("/api/chat/delete")
+def api_chat_delete():
+    """Убирает чат из моего списка (у собеседника он остаётся, если он его не удалял)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто удаляет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата
+    if chat not in DB["chats"] and not ensure_dm_chat(chat):       # чата нет и создать не получилось —
+        return jsonify({"error": "Чат не найден"}), 404            #   сообщаем
+    if username not in chat.split("|"):                            # это не мой чат —
+        return jsonify({"error": "Нет доступа"}), 403
+    with DB_LOCK:                                                 # меняем базу
+        meta = chat_meta(chat)                                    # настройки чата
+        if username not in meta["hidden"]:                        # если ещё не скрыт —
+            meta["hidden"].append(username)                       #   добавляем меня в скрытые
+        others = [p for p in chat.split("|") if p not in ("s", username)]   # остальные участники
+        if all(p in meta["hidden"] for p in others):               # если скрыли все —
+            DB["chats"].pop(chat, None)                           #   чат можно удалить совсем
+        save_db()                                                 # сохраняем
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем список
+    return jsonify({"ok": True})                                  # готово
+
+
+@app.post("/api/chat/mute")
+def api_chat_mute():
+    """Включает или выключает уведомления по чату (в комнатах — для меня лично)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто меняет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата или комнаты
+    on = bool(data.get("on"))                                     # включаем («без звука») или выключаем
+    if chat in DB["chats"] or ensure_dm_chat(chat):                # личный чат (или только что создали) —
+        chat_meta(chat)["muted"][username] = on                   #   запоминаем настройку
+    elif chat in (DB.get("rooms") or {}):                         # комната —
+        member = DB["rooms"][chat].setdefault("members", {}).setdefault(username, {})   # моя запись участника
+        member["muted"] = on                                      #   запоминаем
+    else:                                                         # ни того, ни другого —
+        return jsonify({"error": "Чат не найден"}), 404           #   сообщаем
+    save_db()                                                     # сохраняем
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем список
+    return jsonify({"ok": True, "muted": on})                     # готово
+
+
+@app.post("/api/chat/wallpaper")
+def api_chat_wallpaper():
+    """Меняет обои чата: только у меня или у всех (в личном чате — у обоих)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто меняет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата или комнаты
+    scope = data.get("scope") or "me"                             # «me» — у меня, «all» — у всех
+    paper = data.get("wallpaper")                                 # обои: цвет или картинка (или null — сбросить)
+    if chat in DB["chats"] or ensure_dm_chat(chat):                # личный чат (или только что создали) —
+        meta = chat_meta(chat)                                    #   настройки
+        if scope == "all":                                        #   для обоих
+            meta["wallpaper"] = paper                             #     общие обои
+        else:                                                     #   только для себя
+            meta["wallpaper_me"][username] = paper                #     мои обои
+    elif chat in (DB.get("rooms") or {}):                         # комната —
+        room = DB["rooms"][chat]                                  #   её запись
+        role = room_role(room, username)                          #   моя роль
+        if scope == "all" and role not in ("owner", "admin"):      #   менять для всех может только админ
+            return jsonify({"error": "Обои для всех может менять только администратор"}), 403
+        if scope == "all":                                        #   для всех —
+            room["wallpaper"] = paper                             #     запоминаем в комнате
+        else:                                                     #   для себя —
+            room.setdefault("wallpaper_me", {})[username] = paper   #     личные обои
+    else:                                                         # чата нет —
+        return jsonify({"error": "Чат не найден"}), 404           #   сообщаем
+    save_db()                                                     # сохраняем
+    for part in chat.split("|"):                                  # всем участникам чата —
+        if part in DB["users"]:                                   #   кто существует
+            safe_emit("wallpaper_changed", {"chat": chat, "scope": scope, "wallpaper": paper}, room=f"u:{part}")   # сообщаем
+            safe_emit("chats_update", {"chats": chat_list_for(part)}, room=f"u:{part}")   # обновляем список
+    return jsonify({"ok": True})                                  # готово
+
+
+@app.post("/api/chat/block")
+def api_chat_block():
+    """Блокировка человека: он видит «был(а) давно», без аватарки, а переписка пропадает."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто блокирует
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    other = (data.get("with") or "").strip().lower()               # кого блокируют
+    on = bool(data.get("on"))                                     # заблокировать или разблокировать
+    if other not in DB["users"] or other == SYS_USER:              # нет такого человека (или это служба) —
+        return jsonify({"error": "Пользователь не найден"}), 404   #   сообщаем
+    with DB_LOCK:                                                 # меняем базу
+        me = DB["users"][username]                                # моя запись
+        blocked = me.setdefault("blocked", [])                    # список тех, кого я заблокировал
+        if on and other not in blocked:                           # блокируем —
+            blocked.append(other)                                 #   добавляем в список
+            cid = chat_id(username, other)                        #   ID нашей переписки
+            if cid in DB["chats"]:                                #   переписка есть —
+                DB["chats"][cid]["messages"] = []                 #     сообщения пропадают (как и просили)
+                DB["chats"][cid].setdefault("meta", {})["cleared"] = {username: time.time(), other: time.time()}   #   и история считается очищенной
+        if not on and other in blocked:                           # разблокируем —
+            blocked.remove(other)                                 #   убираем из списка
+        save_db()                                                 # сохраняем
+    peer_card = public_user(other, username)                       # карточка собеседника после изменений
+    safe_emit("peer_updated", {"peer": peer_card}, room=f"u:{username}")   # сообщаем мне
+    safe_emit("peer_updated", {"peer": public_user(username, other)}, room=f"u:{other}")   # и собеседнику (у него изменится мой вид)
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем списки
+    safe_emit("chats_update", {"chats": chat_list_for(other)}, room=f"u:{other}")         # у обоих
+    print(f"[GeoMetric] {'Заблокирован' if on else 'Разблокирован'} пользователь: {other}")   # в лог — только логин
+    return jsonify({"ok": True, "blocked": on})                    # готово
+
+
+@app.post("/api/report")
+def api_report():
+    """Жалоба на человека: её видит владелец проекта (аккаунт GeoMetric)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто жалуется
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    about = (data.get("with") or "").strip().lower()               # на кого жалуются
+    reason = (data.get("reason") or "Другое").strip()[:60]          # причина
+    text = (data.get("text") or "").strip()[:600]                  # подробности (если написали)
+    if about not in DB["users"]:                                  # такого человека нет —
+        return jsonify({"error": "Пользователь не найден"}), 404   #   сообщаем
+    with DB_LOCK:                                                 # меняем базу
+        DB.setdefault("reports", []).append({                     # добавляем жалобу
+            "id": uuid.uuid4().hex,                               # номер жалобы
+            "from": username,                                     # кто пожаловался
+            "about": about,                                       # на кого
+            "reason": reason,                                     # причина
+            "text": text,                                         # пояснение
+            "ts": time.time(),                                    # время
+            "status": "new",                                      # состояние: new / ignored / blocked
+        })
+        save_db()                                                 # сохраняем
+    for admin in admins():                                        # всем владельцам проекта —
+        safe_emit("report_new", {"from": username, "about": about, "reason": reason}, room=f"u:{admin}")   # сообщаем о жалобе
+        system_notice(admin, f"Новая жалоба от @{username} на @{about}. Причина: {reason}" + (f". Пояснение: {text}" if text else ""))   # и пишем в чат GeoMetric
+    return jsonify({"ok": True})                                  # готово
+
+
+@app.get("/api/reports")
+def api_reports():
+    """Список жалоб — только для владельца проекта."""
+    username = user_by_token(request.args.get("token"))           # кто спрашивает
+    if not username or not is_admin(username):                     # не владелец —
+        return jsonify({"error": "Нет доступа"}), 403              #   отказываем
+    items = sorted(DB.get("reports", []), key=lambda r: r.get("ts", 0), reverse=True)[:200]   # свежие жалобы сверху
+    return jsonify({"reports": items})                            # отдаём список
+
+
+@app.post("/api/report/action")
+def api_report_action():
+    """Действие владельца по жалобе: проигнорировать или заблокировать нарушителя."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто действует
+    if not username or not is_admin(username):                     # не владелец —
+        return jsonify({"error": "Нет доступа"}), 403              #   отказываем
+    rid = data.get("id") or ""                                    # номер жалобы
+    action = data.get("action") or "ignore"                       # что делаем
+    report = next((r for r in DB.get("reports", []) if r.get("id") == rid), None)   # ищем жалобу
+    if not report:                                                # не нашли —
+        return jsonify({"error": "Жалоба не найдена"}), 404        #   сообщаем
+    about = report.get("about", "")                                # на кого жалоба
+    with DB_LOCK:                                                 # меняем базу
+        report["status"] = "ignored" if action == "ignore" else "blocked"   # новое состояние
+        report["handled_by"] = username                           # кто рассмотрел
+        report["handled_at"] = time.time()                        # когда
+        if about in DB["users"] and action == "block":            # блокируем нарушителя для владельца
+            blocked = DB["users"].setdefault(username, {}).setdefault("blocked", [])   # список блокировок владельца
+            if about not in blocked:                              # если ещё не заблокирован —
+                blocked.append(about)                             #   добавляем
+        save_db()                                                 # сохраняем
+    if report.get("from") in DB["users"]:                         # автору жалобы —
+        system_notice(report["from"], "Ваша жалоба рассмотрена. Спасибо, что помогаете делать GeoMetric лучше!")   # отвечаем
+    if action == "block" and about in DB["users"]:                # если заблокировали нарушителя —
+        system_notice(about, "Ваш аккаунт ограничен: на вас поступили жалобы.")   # сообщаем и ему
+    return jsonify({"ok": True})                                  # готово
+
+
+@app.get("/api/user")
+def api_user():
+    """Карточка одного человека по логину — нужна приложению, чтобы знать про собеседника всё сразу."""
+    username = user_by_token(request.args.get("token"))            # кто спрашивает
+    if not username:                                              # нет доступа —
+        return jsonify({"error": "unauthorized"}), 401            #   сообщаем
+    login = clean_login(request.args.get("username"))              # чей профиль нужен
+    card = public_user(login, username)                            # карточка с учётом приватности
+    if not card:                                                  # человека нет —
+        return jsonify({"error": "not found"}), 404                #   сообщаем
+    return jsonify(card)                                          # отдаём карточку
+
+
+@app.get("/api/contacts")
+def api_contacts():
+    """Мои контакты: люди, с которыми есть переписка, и свои боты (для раздела «Контакты»)."""
+    username = user_by_token(request.args.get("token"))           # кто спрашивает
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    people = []                                                   # список людей
+    for name in sorted(contacts_of(username)):                     # все, с кем есть чат
+        card = public_user(name, username)                        #   карточка
+        if card:                                                  #   если человек существует
+            people.append(card)                                   #     добавляем
+    bots = [public_user(n, username) for n, u in DB["users"].items()   # свои боты
+            if u.get("is_bot") and u.get("owner") == username]     # (только заведённые этим человеком)
+    return jsonify({"contacts": people, "bots": [b for b in bots if b]})   # отдаём список
+
+
+@app.get("/api/admin/backup")
+def api_admin_backup():
+    """Скачать резервную копию базы (только владелец проекта)."""
+    username = user_by_token(request.args.get("token"))           # кто просит
+    if not username or not is_admin(username):                     # не владелец —
+        return jsonify({"error": "Нет доступа"}), 403              #   отказываем
+    return jsonify({"db": DB, "ts": time.time(), "version": SERVER_VERSION})   # отдаём всю базу
+
+
+@app.post("/api/admin/restore")
+def api_admin_restore():
+    """Загрузить резервную копию базы (только владелец проекта)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто просит
+    if not username or not is_admin(username):                     # не владелец —
+        return jsonify({"error": "Нет доступа"}), 403              #   отказываем
+    db = data.get("db")                                           # сама база
+    if not isinstance(db, dict) or "users" not in db:              # это не похоже на базу —
+        return jsonify({"error": "Файл копии повреждён"}), 400      #   сообщаем
+    with DB_LOCK:                                                 # меняем базу
+        DB.clear()                                                # чистим текущую
+        DB.update(fill_db(db))                                    # и заливаем из копии
+        save_db()                                                 # сохраняем на диск
+    ensure_system_user()                                          # проверяем служебный аккаунт
+    print("[GeoMetric] База восстановлена из резервной копии владельцем проекта")   # пишем в лог
+    return jsonify({"ok": True, "users": len(DB["users"])})        # готово
+
+
+@app.get("/api/chat/search")
+def api_chat_search():
+    """Поиск по переписке делает приложение: серверу текст недоступен.
+
+    Здесь отдаём то, что нужно приложению: подсказку о размере истории и ID чата.
+    """
+    username = user_by_token(request.args.get("token"))           # кто ищет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401             # отказываем
+    other = request.args.get("with", "")                           # с кем переписка
+    secret = (request.args.get("secret") or "") == "1"             # секретный чат?
+    cid = secret_chat_id(username, other) if secret else chat_id(username, other)   # ID чата
+    return jsonify({"chat": cid, "count": len(visible_messages(cid, username, 100000))})   # отдаём число сообщений
+
+
+@socketio.on("delete_message")
+def on_delete_message(data):
+    """Удаляет сообщение: «у меня» (только мне) или «у всех» (у обоих)."""
+    username = SID_TO_USER.get(request.sid)                       # кто удаляет
+    if not username:                                              # не авторизован —
+        return                                                    #   выходим
+    data = data or {}                                             # данные события
+    chat = data.get("chat") or ""                                 # где сообщение: ID чата или комнаты
+    mid = data.get("id") or ""                                    # ID сообщения
+    scope = data.get("scope") or "me"                             # «me» или «all»
+    if chat in (DB.get("rooms") or {}):                           # это комната —
+        room = DB["rooms"][chat]                                  #   её запись
+        msg = next((m for m in room.get("messages", []) if m.get("id") == mid), None)   # ищем сообщение
+        if not msg:                                               # не нашли —
+            return                                                #   выходим
+        role = room_role(room, username)                          # моя роль в комнате
+        mine = msg.get("from") == username                        # это моё сообщение?
+        if scope == "all" and not (mine or role in ("owner", "admin")):   # удалять чужое для всех может админ
+            scope = "me"                                          #   иначе удаляем только у себя
+        with DB_LOCK:                                             # меняем базу
+            if scope == "all":                                    # у всех —
+                msg["deleted"] = True                             #   помечаем удалённым
+                msg["e2e"] = None                                 #   и стираем содержимое
+                msg["plain"] = None                               #   (и открытое тоже)
+            else:                                                 # только у себя —
+                room.setdefault("deleted_for", {}).setdefault(username, []).append(mid)   #   запоминаем
+            save_db()                                             # сохраняем
+        for member in list(room.get("members", {}).keys()):        # всем участникам —
+            safe_emit("message_deleted", {"chat": chat, "id": mid, "scope": scope}, room=f"u:{member}")   # сообщаем
+        return                                                    # готово
+    if chat not in DB["chats"]:                                   # личного чата нет —
+        return                                                    #   выходим
+    if username not in chat.split("|"):                            # не мой чат —
+        return                                                    #   выходим
+    msg = next((m for m in DB["chats"][chat].get("messages", []) if m.get("id") == mid), None)   # ищем сообщение
+    if not msg:                                                   # не нашли —
+        return                                                    #   выходим
+    if scope == "all" and msg.get("from") != username:              # чужое сообщение можно удалить только у себя
+        scope = "me"                                              #   понижаем область удаления
+    with DB_LOCK:                                                 # меняем базу
+        meta = chat_meta(chat)                                    # настройки чата
+        if scope == "all":                                        # удалить у всех —
+            msg["deleted"] = True                                 #   помечаем
+            msg["e2e"] = None                                     #   и стираем содержимое
+            msg["plain"] = None                                   #   (сервер тоже не хранит лишнего)
+        else:                                                     # только у себя —
+            meta["deleted_for"].setdefault(username, []).append(mid)   #   запоминаем для меня
+        save_db()                                                 # сохраняем
+    if not chat_is_secret(chat):                                   # обычный чат —
+        print(f"[GeoMetric] Сообщение удалено ({scope}) в чате {chat}")   # пишем факт без содержимого
+    for part in chat.split("|"):                                  # всем участникам —
+        if part in DB["users"]:                                   #   кто существует
+            safe_emit("message_deleted", {"chat": chat, "id": mid, "scope": scope}, room=f"u:{part}")   # сообщаем
+
+
 @socketio.on("connect")
 def on_connect():
     """Кто-то подключился (авторизация будет отдельным шагом)."""
@@ -707,13 +2130,17 @@ def on_connect():
 
 
 @socketio.on("disconnect")
-def on_disconnect():
+def on_disconnect(*_args):
+    # «Звёздочка» в аргументах нужна потому, что новые версии библиотеки передают
+    # в этот обработчик причину закрытия соединения, а нам она не важна.
     """Соединение закрылось — помечаем человека «не в сети» (если у него нет других устройств)."""
     username = SID_TO_USER.pop(request.sid, None)                 # кто отключился
     if not username:                                              # анонимное соединение
         return
     if username in SID_TO_USER.values():                          # есть ещё открытые вкладки/устройства
         return                                                    #   статус не снимаем
+    if username not in DB["users"]:                               # человека уже нет в базе (например, базу откатили из копии) —
+        return                                                    #   тогда отмечать нечего
     with DB_LOCK:                                                 # меняем базу
         DB["users"][username]["online"] = False                   #   офлайн
         DB["users"][username]["last_seen"] = time.time()          #   время последней активности
@@ -758,13 +2185,20 @@ def on_send_message(data):
         return
     # Отправка самому себе разрешена: так работает «Избранное» — личная заметка/файл.
     kind = (data or {}).get("kind", "text")                       # тип: text или media
-    if kind not in ("text", "media"):                             # другие типы клиент присылать не должен
-        return
+    if kind not in ("text", "media", "sticker", "voice", "circle"):   # разрешённые виды сообщений
+        return                                                    #   прочие виды не принимаем
     e2e = (data or {}).get("e2e")                                 # зашифрованный «конверт» (сервер не читает)
     plain = (data or {}).get("plain")                             # незашифрованный вариант (только в режиме без E2EE)
     if not e2e and not plain:                                     # ни того, ни другого —
         return                                                    #   отправлять нечего
-    cid = chat_id(username, to)                                   # ID чата
+    secret = bool((data or {}).get("secret"))                     # это сообщение в секретном чате?
+    peer_blocked_me = username in ((DB["users"].get(to) or {}).get("blocked") or [])   # собеседник меня заблокировал?
+    if peer_blocked_me and not secret:                            # заблокирован —
+        emit("error_msg", {"error": "Сообщение не отправлено"}, room=f"u:{username}")   #   сообщаем себе
+        return                                                    #   и не отправляем ничего
+    cid = secret_chat_id(username, to) if secret else chat_id(username, to)   # ID чата
+    if secret:                                                    # для секретного чата
+        chat_meta(cid)["secret"] = True                           #   помечаем его секретным
     msg = {
         "id": uuid.uuid4().hex,                                   # уникальный ID
         "chat": cid,                                              # чат
@@ -776,6 +2210,7 @@ def on_send_message(data):
         "call": None,                                             # для журнала звонков (заполняется отдельно)
         "ts": time.time(),                                        # время отправки
         "read": False,                                            # прочитано?
+        "secret": secret,                                         # сообщение секретного чата?
     }
     with DB_LOCK:                                                 # пишем в базу
         get_chat(cid)["messages"].append(msg)                     #
@@ -783,13 +2218,22 @@ def on_send_message(data):
         save_db()                                                 #
     emit("new_message", msg, room=f"u:{to}")                      # получателю (на все его устройства)
     emit("new_message", msg, room=f"u:{username}")                # и себе (синхронизация вкладок)
+    # Если написали Стикер-боту — сам сервер исполняет его роль: разбирает команды и картинки.
+    if to == STICKER_BOT_USER:                                     # получатель — служебный Стикер-бот
+        try:                                                       # любые ошибки бота не должны ронять сервер
+            bot_file = (plain or {}).get("file") or None            # картинка из открытого сообщения (если была)
+            sticker_bot_handle(username, (plain or {}).get("text") or "", bot_file)   # отдаём команду боту
+        except Exception as e:                                      # что-то пошло не так —
+            print(f"[GeoMetric] Стикер-бот: ошибка обработки: {e}")    #   пишем в лог и продолжаем
     # Обновляем СПИСОК ЧАТОВ у обоих: если переписка только началась, у получателя
     # должен появиться новый диалог (иначе сообщение «придёт в никуда»).
     emit("chats_update", {"chats": chat_list_for(to)}, room=f"u:{to}")
     emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")
     # В консоль выводим только метаданные: кто, кому, сколько байт. Содержимое нам недоступно.
-    print(f"[GeoMetric] {username} → {to}: {kind}, "
-          f"{len((e2e or {}).get('c', '') or (plain or {}).get('text', ''))} симв. шифротекста")
+    # Для секретных чатов в консоль НЕ пишем ничего — они не оставляют следов.
+    if not secret:                                                # обычный чат —
+        print(f"[GeoMetric] {username} → {to}: {kind}, "
+              f"{len((e2e or {}).get('c', '') or (plain or {}).get('text', ''))} симв. шифротекста")
 
 
 @socketio.on("typing")
@@ -831,7 +2275,8 @@ def on_get_history(data):
     other = (data or {}).get("with")                              # с кем
     if not username or not other:                                 # нет данных
         return
-    cid = chat_id(username, other)                                # ID чата
+    secret = bool((data or {}).get("secret"))                     # просят историю секретной переписки?
+    cid = secret_chat_id(chat_id(username, other)) if secret else chat_id(username, other)   # ID чата (с отметкой «секретный»)
     msgs = DB["chats"].get(cid, {}).get("messages", [])           # сообщения
     emit("history", {"chat": cid, "with": other, "messages": msgs[-800:],
                      "peer": public_user(other, username)})       # отдаём «конверты» и карточку собеседника
@@ -963,6 +2408,9 @@ def on_call_offer(data):
     call_id = (data or {}).get("call_id")                         # ID звонка
     if not username or not to or to not in DB["users"] or not call_id:   # данные неполные
         return
+    if DB["users"].get(to, {}).get("is_bot"):                     # боту звонить нельзя —
+        emit("call_error", {"text": "Ботам нельзя звонить"})       #   сразу отвечаем понятной ошибкой
+        return                                                    #   и выходим
     call = {
         "id": call_id,                                            # ID
         "from": username,                                         # звонящий
@@ -1115,8 +2563,11 @@ def room_list_for(username):
             "peer": None,                                          # собеседника нет — рисуем аватар комнаты
             "last": last,                                          # последний «конверт»
             "ts": last["ts"] if last else room.get("created", 0),  # время для сортировки
-            "unread": room_unread(room, username),                 # непрочитанных
+            "unread": 0 if (room.get("members", {}).get(username, {}) or {}).get("muted") else room_unread(room, username),   # непрочитанных (в «без звука» не считаем)
             "post": room_can_post(room, username),                 # могу ли я писать в эту комнату
+            "muted": bool((room.get("members", {}).get(username, {}) or {}).get("muted")),   # чат «без звука»
+            "wallpaper": (room.get("wallpaper_me", {}) or {}).get(username) or room.get("wallpaper"),   # обои комнаты
+            "pinned": bool((DB["users"].get(username) or {}).get("pinned") == room.get("id")),   # это мой закреплённый канал?
         })
     return out                                                     # отдаём список
 
@@ -1266,8 +2717,8 @@ def on_send_room_message(data):
     if not room_can_post(room, username):                          # право писать
         emit("error_msg", {"text": "В этом канале писать могут только администраторы"}); return   # в канале молчим
     kind = data.get("kind", "text")                                # тип содержимого
-    if kind not in ("text", "media", "call"):                      # поддерживаемые типы
-        return
+    if kind not in ("text", "media", "call", "sticker", "voice", "circle"):   # поддерживаемые типы
+        return                                                    #   прочие виды не принимаем
     e2e = data.get("e2e")                                          # зашифрованный «конверт»
     plain = data.get("plain")                                      # открытый вариант (только когда браузер не умеет шифровать)
     if not e2e and not plain:                                      # нечего отправлять
@@ -1442,39 +2893,8 @@ def on_get_rooms():
     emit("rooms_found", {"rooms": public})                         # отдаём
 
 
-@socketio.on("delete_message")
-def on_delete_message(data):
-    """Удаление своего сообщения (у всех участников)."""
-    username = SID_TO_USER.get(request.sid)                        # кто удаляет
-    data = data or {}                                              # данные
-    mid = data.get("id")                                           # ID сообщения
-    room = room_of(data.get("room")) if data.get("room") else None  # комната (если это группа)
-    targets = []                                                   # кого уведомлять
-    with DB_LOCK:                                                  # под замком
-        if room:                                                   # сообщение в комнате
-            for m in room.get("messages", []):                     # ищем его
-                if m["id"] == mid and m.get("from") == username and not m.get("deleted"):   # своё и не удалено
-                    m["deleted"] = True                            # помечаем удалённым
-                    m["e2e"] = None                                # и стираем содержимое
-                    m["plain"] = None                              #
-                    targets = room_members(room)                   # уведомляем всех участников
-                    break                                          #
-        else:                                                      # личный чат
-            other = data.get("with")                               # собеседник
-            cid = chat_id(username, other) if other else None      # ID чата
-            chat = DB["chats"].get(cid) if cid else None           # сам чат
-            if chat:                                               # если найден
-                for m in chat.get("messages", []):                 # ищем сообщение
-                    if m["id"] == mid and m.get("from") == username and not m.get("deleted"):   # своё и не удалено
-                        m["deleted"] = True                        # помечаем
-                        m["e2e"] = None                            # стираем содержимое
-                        m["plain"] = None                          #
-                        targets = [username, other]                # уведомляем обоих
-                        break                                      #
-        save_db()                                                  # сохраняем базу
-    for u in targets:                                              # всем, кого это касается
-        emit("message_deleted", {"id": mid, "room": room["id"] if room else None}, room=f"u:{u}")   # сообщаем об удалении
-        broadcast_rooms(u)                                         # и обновляем превью чата
+# Старый обработчик удаления заменён новым (см. выше): он умеет и «у меня», и «у всех»,
+# и работает как в личных чатах, так и в группах.
 
 
 # ---------------------------------------------------------------------------
@@ -1483,8 +2903,10 @@ def main():
     parser = argparse.ArgumentParser(description="GeoMetric — сервер мессенджера со сквозным шифрованием")
     parser.add_argument("--host", default="0.0.0.0", help="адрес прослушивания (0.0.0.0 — доступен в сети)")
     parser.add_argument("--port", type=int, default=5000, help="порт (по умолчанию 5000)")
+    parser.add_argument("--api-only", action="store_true",
+                        help="только данные: не отдавать веб-версию приложения (по умолчанию она включена)")
     parser.add_argument("--serve-ui", action="store_true",
-                        help="предпросмотр: отдавать и интерфейс приложения (для проверки в браузере)")
+                        help="оставлено для совместимости: раньше включало веб-версию (сейчас она включена всегда)")
     parser.add_argument("--data-dir", default=None,
                         help="папка для данных (сообщения, файлы). По умолчанию — data рядом с сервером")
     args = parser.parse_args()                                    # разбираем аргументы
@@ -1498,13 +2920,16 @@ def main():
         load_into_memory()                                         #   и перечитываем базу из нового места
 
     ensure_socketio_client()                                      # проверяем наличие js-библиотеки socket.io
+    ensure_sticker_bot()                                          # создаём служебного Стикер-бота (если его ещё нет)
+    ensure_system_user()                                          # создаём служебный аккаунт GeoMetric (владелец проекта)
 
     users = len(DB["users"])                                      # сколько пользователей уже зарегистрировано
     print("=" * 64)
     print("  GeoMetric запущен")
     print(f"  Адрес:            http://localhost:{args.port}")
     print(f"  Пользователей:    {users}" if users else "  Пользователей:    пока никого — создай аккаунт в приложении")
-    print("  Шифрование:       включено (E2EE, AES-GCM + ECDH). Сервер не читает переписку.")
+    print(f"  Данные:           {DATA_DIR}")                       # где лежит база (на хостинге нужен постоянный диск)
+    print("  Режим работы:     содержимое переписки серверу не видно")
     print("=" * 64)
 
     socketio.run(                                                 # запускаем сервер
