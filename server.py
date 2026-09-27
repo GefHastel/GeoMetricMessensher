@@ -844,6 +844,7 @@ def chat_meta(cid: str) -> dict:
     meta.setdefault("hidden", [])                                # кто убрал чат из своего списка
     meta.setdefault("wallpaper", None)                           # обои для обоих (если меняли «у всех»)
     meta.setdefault("wallpaper_me", {})                          # личные обои (логин → обои)
+    meta.setdefault("pinned", {})                                # закреплённые чаты: логин → время закрепления
     meta.setdefault("deleted_for", {})                           # кому какое сообщение не показывать
     meta.setdefault("secret", bool(meta.get("secret")))           # это секретный чат?
     return meta                                                  # отдаём настройки
@@ -865,6 +866,13 @@ def dm_peer(cid: str, me: str) -> str:
     if len(parts) >= 2 and parts[0] == parts[1]:                 # «Избранное» (чат с самим собой)
         return me                                                #   собеседник — я сам
     return next((p for p in parts if p != me), "") or ""         # иначе — второй участник
+
+
+def message_public(m):
+    """Сообщение в том виде, в каком оно уходит клиенту: без служебных полей, но с реакциями."""
+    out = dict(m)                                                 # копия записи
+    out["reactions"] = m.get("reactions") or {}                   # реакции (значок → кто поставил)
+    return out                                                    # отдаём
 
 
 def visible_messages(cid: str, me: str, limit: int = 800) -> list:
@@ -943,9 +951,12 @@ def chat_list_for(username):
             "muted": bool((meta.get("muted", {}) or {}).get(username)),   # чат «без звука»
             "wallpaper": (meta.get("wallpaper_me", {}) or {}).get(username) or meta.get("wallpaper"),   # обои чата
             "autodelete": int(meta.get("autodelete") or 0),        # автоудаление: через сколько секунд исчезают сообщения (0 — выключено)
+            "pinned": bool((meta.get("pinned") or {}).get(username)),   # этот чат я закрепил?
+            "pinned_ts": float((meta.get("pinned") or {}).get(username) or 0),   # когда закрепил (для порядка внутри закреплённых)
         })
     out.extend(room_list_for(username))                           # добавляем группы и каналы
-    out.sort(key=lambda c: c["ts"], reverse=True)                 # свежие чаты сверху
+    # Закреплённые чаты всегда сверху (среди них — по времени закрепления), дальше свежие.
+    out.sort(key=lambda c: (1 if c.get("pinned") else 0, c.get("pinned_ts", 0) if c.get("pinned") else c["ts"]), reverse=True)
     return out                                                    # отдаём
 
 
@@ -1044,6 +1055,23 @@ def broadcast_presence(username):
 SERVE_UI = "--api-only" not in sys.argv                    # отдавать ли интерфейс вместе с данными
 if SERVE_UI:                                              # обычный режим (он же веб-версия) —
     app = Flask(__name__, static_folder=str(WWW_DIR), static_url_path="")   #   файлы интерфейса из папки www
+
+    @app.after_request                                              # ко всем ответам сервера
+    def no_cache_ui(response):
+        """Запрещаем браузеру держать старую копию интерфейса.
+
+        Без этого после обновления люди видели прежний сайт, пока не нажмут Ctrl+F5.
+        Данные переписки и так не кэшируются, а вот страницу и скрипты — не даём.
+        """
+        путь = request.path or ""                                    # какой адрес запросили
+        if путь.startswith("/api/") or путь.startswith("/socket.io/"):   # служебные адреса —
+            response.headers["Cache-Control"] = "no-store"            #   тоже без копий
+            return response                                          #   и выходим
+        if путь == "/" or путь.endswith((".html", ".js", ".css", ".webmanifest")):   # страница и её файлы —
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"   #   всегда проверять у сервера
+            response.headers["Pragma"] = "no-cache"                   # для старых браузеров
+            response.headers["Expires"] = "0"                         # «срок годности» истёк сразу
+        return response                                              # отдаём ответ
 else:                                                     # режим «только данные» --
     app = Flask(__name__, static_folder=None)             #   файлы интерфейса не раздаются
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD                     # лимит размера загрузки
@@ -2140,6 +2168,25 @@ def api_chat_clear():
     return jsonify({"ok": True})                                  # готово
 
 
+@app.post("/api/room/delete")
+def api_room_delete():
+    """Убирает группу или канал из МОЕГО списка (сама комната и другие участники не затрагиваются)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто убирает
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    room = room_of(data.get("room") or "")                        # комната
+    if not room or username not in (room.get("members") or {}):    # комнаты нет или я не участник
+        return jsonify({"error": "Комната не найдена"}), 404
+    with DB_LOCK:                                                 # меняем базу
+        room.setdefault("hidden", [])                             # список «убрал у себя»
+        if username not in room["hidden"]:                        # если ещё не убрана —
+            room["hidden"].append(username)                       #   добавляем меня
+        save_db()                                                 # сохраняем
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем мой список
+    return jsonify({"ok": True})                                  # готово
+
+
 @app.post("/api/chat/delete")
 def api_chat_delete():
     """Убирает чат из моего списка (у собеседника он остаётся, если он его не удалял)."""
@@ -2218,6 +2265,34 @@ def api_chat_wallpaper():
             safe_emit("wallpaper_changed", {"chat": chat, "scope": scope, "wallpaper": paper}, room=f"u:{part}")   # сообщаем
             safe_emit("chats_update", {"chats": chat_list_for(part)}, room=f"u:{part}")   # обновляем список
     return jsonify({"ok": True})                                  # готово
+
+
+@app.post("/api/chat/pin")
+def api_chat_pin():
+    """Закрепляет или открепляет чат в списке. У каждого человека список свой."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто закрепляет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата или комнаты
+    on = bool(data.get("on"))                                     # закрепить или открепить
+    if chat in DB["chats"] or ensure_dm_chat(chat):               # личный чат —
+        pinned = chat_meta(chat).setdefault("pinned", {})          #   список закреплённых
+        if on:                                                    #   закрепляем —
+            pinned[username] = time.time()                        #     запоминаем время
+        else:                                                     #   открепляем —
+            pinned.pop(username, None)                            #     убираем отметку
+    elif chat in (DB.get("rooms") or {}):                         # комната —
+        pinned = DB["rooms"][chat].setdefault("pinned", {})        #   её список закреплённых
+        if on:                                                    #   закрепляем —
+            pinned[username] = time.time()                        #     запоминаем
+        else:                                                     #   иначе —
+            pinned.pop(username, None)                            #     убираем
+    else:                                                         # чата нет —
+        return jsonify({"error": "Чат не найден"}), 404            #   сообщаем
+    save_db()                                                     # сохраняем
+    safe_emit("chats_update", {"chats": chat_list_for(username)}, room=f"u:{username}")   # обновляем список у себя
+    return jsonify({"ok": True, "pinned": on})                    # готово
 
 
 @app.post("/api/chat/autodelete")
@@ -2576,6 +2651,80 @@ def on_auth(data):
         "my_stories": my_stories_payload(username),               #   свои истории
     })
     broadcast_presence(username)                                  # контактам: «я в сети»
+
+
+REACTIONS_ALLOWED = ("👍", "❤️", "😂", "😮", "😢", "🔥", "🙏", "👎")   # какие реакции разрешены
+
+
+def apply_reaction(kind, chat_or_room, msg_id, username, emoji):
+    """Ставит или снимает реакцию на сообщение. Возвращает список реакций или None."""
+    if emoji not in REACTIONS_ALLOWED:                            # такой реакции у нас нет —
+        return None                                               #   отказываем
+    if kind == "room":                                            # сообщение в группе или канале
+        store = (DB.get("rooms") or {}).get(chat_or_room) or {}     # запись комнаты
+        msgs = store.get("messages") or []                        # её сообщения
+        участники = list((store.get("members") or {}).keys())      # кто в комнате
+    else:                                                         # сообщение в личной переписке
+        msgs = (DB["chats"].get(chat_or_room) or {}).get("messages") or []   # сообщения чата
+        участники = [p for p in str(chat_or_room).split("|") if p]          # оба собеседника
+    msg = next((m for m in msgs if m.get("id") == msg_id), None)   # ищем само сообщение
+    if not msg:                                                   # не нашли —
+        return None                                               #   отказываем
+    reactions = msg.setdefault("reactions", {})                    # таблица реакций: значок → кто поставил
+    who = reactions.setdefault(emoji, [])                          # список людей для этого значка
+    if username in who:                                            # уже ставил такую —
+        who.remove(username)                                      #   снимаем её
+    else:                                                          # ещё не ставил —
+        who.append(username)                                      #   ставим
+    if not who:                                                    # если никто не поставил —
+        reactions.pop(emoji, None)                                #   убираем значок совсем
+    if not reactions:                                              # реакций не осталось —
+        msg.pop("reactions", None)                                #   чистим поле
+    save_db()                                                     # сохраняем
+    return {"id": msg_id, "reactions": msg.get("reactions") or {}, "who": participants_out(участники)}
+
+
+def participants_out(логины):
+    """Кто должен получить обновление реакции."""
+    return [л for л in логины if л in DB["users"]]                # только существующие люди
+
+
+@socketio.on("react_message")
+def on_react_message(data):
+    """Поставили или сняли реакцию на сообщение."""
+    username = SID_TO_USER.get(request.sid)                       # кто нажал
+    if not username:                                              # не авторизован —
+        return                                                    #   выходим
+    data = data or {}                                             # данные запроса
+    msg_id = data.get("id") or ""                                 # какое сообщение
+    emoji = data.get("emoji") or ""                               # какой значок
+    room = data.get("room")                                       # группа или канал (если это комната)
+    chat = data.get("chat")                                       # личный чат (если это переписка)
+    if room:                                                      # сообщение в комнате
+        if room not in (DB.get("rooms") or {}):                    # такой комнаты нет —
+            return                                                #   выходим
+        if username not in ((DB["rooms"][room].get("members") or {})):   # я не участник —
+            return                                                #   выходим
+        результат = apply_reaction("room", room, msg_id, username, emoji)   # ставим реакцию
+        цель = room                                               # куда отдавать обновление
+    elif chat:                                                    # сообщение в личной переписке
+        if chat not in DB["chats"] and not ensure_dm_chat(chat):    # чата нет —
+            return                                                #   выходим
+        результат = apply_reaction("chat", chat, msg_id, username, emoji)   # ставим реакцию
+        цель = None                                               # получателей возьмём из результата
+    else:                                                         # ни чат, ни комната не указаны —
+        return                                                    #   выходим
+    if not результат:                                             # не получилось (нет сообщения или значка) —
+        return                                                    #   выходим
+    событие = {"id": msg_id, "chat": chat or room, "room": room or None, "reactions": результат["reactions"], "from": username}   # что рассылаем
+    if room:                                                      # в комнате — всем участникам
+        for кто in DB["rooms"][room].get("members", {}):           # по участникам
+            socketio.emit("message_reaction", событие, room=f"u:{кто}")   # каждому лично
+        print(f"[GeoMetric] Реакция в комнате: {emoji}")            # в лог — только значок, без содержания
+    else:                                                         # в личной переписке — обоим
+        for кто in результат["who"]:                               # по собеседникам
+            socketio.emit("message_reaction", событие, room=f"u:{кто}")   # каждому лично
+        print(f"[GeoMetric] Реакция в переписке: {emoji}")          # в лог — только значок
 
 
 @socketio.on("send_message")
@@ -2957,11 +3106,13 @@ def room_unread(room, username):
 
 
 def room_list_for(username):
-    """Строки групп и каналов для моего списка чатов."""
+    """Строки групп и каналов для моего списка чатов (убранные мной — не показываем)."""
     out = []                                                       # результат
     for room in DB.get("rooms", {}).values():                       # по всем комнатам сервера
         if username not in room.get("members", {}):                 # я не участник —
             continue                                               #   не показываем
+        if username in (room.get("hidden") or []):                  # я убрал эту комнату из списка —
+            continue                                               #   больше её не показываем
         last = room_last_message(room)                              # последнее сообщение
         out.append({
             "kind": "room",                                        # это комната
@@ -2975,6 +3126,8 @@ def room_list_for(username):
             "role": room_role(room, username),                     # моя роль
             "members": len(room.get("members", {})),               # сколько участников
             "peer": None,                                          # собеседника нет — рисуем аватар комнаты
+            "pinned": bool((room.get("pinned") or {}).get(username)),   # эта группа или канал закреплены мной?
+            "pinned_ts": float((room.get("pinned") or {}).get(username) or 0),   # когда закрепил
             "last": last,                                          # последний «конверт»
             "ts": last["ts"] if last else room.get("created", 0),  # время для сортировки
             "unread": 0 if (room.get("members", {}).get(username, {}) or {}).get("muted") else room_unread(room, username),   # непрочитанных (в «без звука» не считаем)
