@@ -1424,6 +1424,36 @@ def api_history():
     })
 
 
+@app.get("/api/calls")
+def api_calls():
+    """Журнал звонков: последние звонки из моих переписок (исходящие, входящие, пропущенные)."""
+    username = user_by_token(request.args.get("token"))            # чей журнал просят
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    звонки = []                                                   # сюда собираем записи
+    for cid, chat in (DB.get("chats") or {}).items():             # по всем перепискам базы
+        участники = cid.split("|")                                # кто в этой переписке
+        if username not in участники and not cid.startswith("s|"):   # чужая переписка —
+            continue                                              #   пропускаем
+        for m in (chat.get("messages") or []):                    # по сообщениям переписки
+            if m.get("kind") != "call":                           # нас интересуют только звонки
+                continue
+            info = m.get("call") or {}                            # данные звонка (статус, длительность)
+            собеседник = m.get("to") if m.get("from") == username else m.get("from")   # с кем говорили
+            звонки.append({
+                "id": m.get("id"),                                # ID записи
+                "with": собеседник,                               # с кем
+                "outgoing": m.get("from") == username,            # исходящий ли
+                "status": info.get("status") or "",               # dialing / answered / missed / declined / busy
+                "video": bool(info.get("video")),                 # видеозвонок или аудио
+                "duration": int(info.get("duration") or 0),       # сколько длился разговор
+                "ts": m.get("ts") or 0,                           # когда звонили
+                "person": public_user(собеседник, username) if собеседник in DB["users"] else {"username": собеседник or ""},   # карточка собеседника
+            })
+    звонки.sort(key=lambda x: x["ts"], reverse=True)              # свежие звонки — сверху
+    return jsonify({"calls": звонки[:60]})                        # отдаём последние шестьдесят
+
+
 @app.get("/api/stories")
 def api_stories():
     """Чужие истории."""
