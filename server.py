@@ -623,6 +623,62 @@ def detect_platform(ua: str, given: str = "") -> str:           # как под�
     return "Устройство"                                         # совсем ничего не поняли
 
 
+DEVICE_REGIONS = {}                                            # кэш «адрес → регион», чтобы не спрашивать часто
+
+
+def device_name_ru(platform):
+    """Понятное название устройства для уведомлений и списка устройств.
+
+    В базе уже лежат человеческие подписи («Приложение для ПК», «Веб-версия (браузер)»),
+    поэтому их не переписываем. Меняем только «машинные» значения, если такие попадутся.
+    """
+    p = (platform or "").strip()                        # исходная подпись без пробелов
+    низ = p.lower()                                     # то же в нижнем регистре
+    if "geometricdesktop" in низ:                       # машинная подпись приложения для ПК
+        return "Приложение для ПК"                      # говорим по-человечески
+    if "geometricapp" in низ:                           # машинная подпись приложения для телефона
+        return "Приложение для Android"                 # говорим по-человечески
+    return p or "Устройство"                            # всё остальное оставляем как есть
+
+
+def device_kind(platform):
+    """Вид устройства для значка: телефон или компьютер.
+
+    Если человек вошёл через браузер, мы всё равно показываем, с чего он зашёл —
+    с телефона или с компьютера, — а рядом клиент рисует маленький значок браузера.
+    """
+    p = (platform or "").lower()                        # нижний регистр
+    if "android" in p or "iphone" in p or "ipad" in p or "телефон" in p:   # телефон или планшет
+        return "phone"                                  # значок телефона
+    return "desktop"                                    # по умолчанию — компьютер
+
+
+def is_browser_platform(platform):
+    """Вход был через браузер (сайт), а не через приложение?"""
+    p = (platform or "").lower()                        # нижний регистр
+    return ("браузер" in p or "browser" in p or "веб" in p or "web" in p)   # признаки браузера
+
+
+def device_region(ip):
+    """Регион по адресу устройства. Спрашиваем у бесплатного справочника один раз и запоминаем."""
+    ip = (ip or "").strip()                            # адрес без пробелов
+    if not ip or ip.startswith(("127.", "10.", "192.168.", "169.254.", "172.16.", "::1")):   # свой, домашний адрес — региона нет
+        return ""                                      # не показываем ничего
+    if ip in DEVICE_REGIONS:                           # уже спрашивали —
+        return DEVICE_REGIONS[ip]                      #   отвечаем из памяти
+    region = ""                                        # по умолчанию — пусто
+    try:                                               # справочник может быть недоступен
+        import urllib.request                          # берём стандартную библиотеку
+        with urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=country,city&lang=ru", timeout=3) as r:   # короткий запрос
+            info = json.loads(r.read().decode("utf-8", "ignore"))   # разбираем ответ
+        parts = [info.get("country") or "", info.get("city") or ""]   # страна и город
+        region = ", ".join([x for x in parts if x])    # «Россия, Москва»
+    except Exception:                                  # справочник не ответил —
+        region = ""                                    #   оставляем пусто
+    DEVICE_REGIONS[ip] = region                        # запоминаем ответ
+    return region                                      # отдаём регион
+
+
 def remember_device(username, device):                        # записать устройство в профиль
     """Запоминает устройство входа: имя, систему, время. Нужно для списка устройств в настройках."""
     info = device or {}                                       # данные от приложения (может быть пусто)
@@ -653,8 +709,11 @@ def devices_payload(username, current_device=None):           # список у�
         out.append({                                          # описываем одно устройство
             "id": dev.get("id"),                              #   идентификатор
             "name": dev.get("name") or "Устройство",          #   имя
-            "platform": dev.get("platform") or "",            #   система
+            "platform": device_name_ru(dev.get("platform")),  #   система — понятными словами
+            "kind": device_kind(dev.get("platform")),         #   вид: телефон или компьютер (для большого значка)
+            "browser": is_browser_platform(dev.get("platform")),   #   вход через браузер? тогда клиент дорисует значок браузера
             "ip": dev.get("ip") or "",                        #   адрес (виден только владельцу)
+            "region": device_region(dev.get("ip")),           #   регион по адресу (например, «Россия, Москва»)
             "created": dev.get("created", 0),                 #   когда устройство впервые вошло
             "last_seen": dev.get("last_seen", 0),             #   когда было в сети последний раз
             "current": dev.get("id") == current_device,       #   это то устройство, где мы сейчас смотрим?
@@ -817,6 +876,8 @@ def visible_messages(cid: str, me: str, limit: int = 800) -> list:
     msgs = chat.get("messages", [])                               # все сообщения
     meta = chat.get("meta") or {}                                 # настройки чата
     since = (meta.get("cleared") or {}).get(me, 0)                # когда я очищал историю
+    авто = int(meta.get("autodelete") or 0)                       # срок автоудаления в секундах (0 — выключено)
+    порог = (time.time() - авто) if авто else 0                    # сообщения старше этого времени уже удалены
     hidden_for_me = set((meta.get("deleted_for") or {}).get(me, []))   # что я удалил «у себя»
     out = []                                                      # результат
     for m in msgs:                                                # проходим по сообщениям
@@ -826,6 +887,8 @@ def visible_messages(cid: str, me: str, limit: int = 800) -> list:
             continue                                              #   не показываем
         if m.get("ts", 0) <= since:                               # было раньше очистки истории —
             continue                                              #   не показываем
+        if порог and m.get("ts", 0) < порог:                      # включено автоудаление и срок вышел —
+            continue                                              #   сообщение больше не показываем
         out.append(m)                                             # иначе — показываем
     return out[-limit:]                                           # отдаём последние сообщения
 
@@ -879,6 +942,7 @@ def chat_list_for(username):
             "secret": secret,                                     # секретный чат (в интерфейсе — замочек)
             "muted": bool((meta.get("muted", {}) or {}).get(username)),   # чат «без звука»
             "wallpaper": (meta.get("wallpaper_me", {}) or {}).get(username) or meta.get("wallpaper"),   # обои чата
+            "autodelete": int(meta.get("autodelete") or 0),        # автоудаление: через сколько секунд исчезают сообщения (0 — выключено)
         })
     out.extend(room_list_for(username))                           # добавляем группы и каналы
     out.sort(key=lambda c: c["ts"], reverse=True)                 # свежие чаты сверху
@@ -1119,8 +1183,14 @@ def api_login():
     device_id = remember_device(username, data.get("device"))      # запоминаем устройство входа
     TOKEN_DEVICE[token] = (username, device_id)                   # и привязываем к нему токен
     device = (u.get("devices") or {}).get(device_id) or {}         # данные этого устройства
-    system_notice(username, f"Выполнен вход в аккаунт: {device.get('platform') or 'устройство'} "
+    system_notice(username, f"Вход с нового устройства: {device_name_ru(device.get('platform'))} "
                             f"({device.get('name') or 'без названия'}). Если это были не вы — смените пароль.")   # предупреждаем
+    # Кроме сообщения в «Избранном» шлём отдельное системное уведомление: на телефоне
+    # и на компьютере оно выглядит как «Вход с нового устройства», а не как «Сообщение».
+    safe_emit("security_notice", {
+        "title": "Вход с нового устройства",                                  # заголовок уведомления
+        "text": f"{device_name_ru(device.get('platform'))} · {device.get('name') or 'без названия'} · {device.get('ip') or ''}".strip(" ·"),   # подробности
+    }, room=f"u:{username}")                                                  # только самому человеку
     return jsonify({
         "token": token,                                           # токен для последующих запросов
         "me": me_payload(username),                               # мой профиль
@@ -1188,6 +1258,21 @@ def api_keys_replace():
         save_db()                                                 #
     print(f"[GeoMetric] Пользователь {username} сменил ключи шифрования")
     return jsonify({"ok": True})
+
+
+@app.post("/api/devices/revoke-others")
+def api_devices_revoke_others():
+    """Отключает все устройства, кроме того, с которого пришёл запрос."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто просит
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    keep = data.get("keep") or ""                                 # устройство, которое оставляем (текущее)
+    u = DB["users"].get(username) or {}                           # запись человека
+    ids = [d for d in (u.get("devices") or {}).keys() if d != keep]   # все устройства, кроме текущего
+    for device_id in ids:                                         # по каждому лишнему устройству
+        drop_device(username, device_id)                          # отключаем его (сессии тоже гаснут)
+    return jsonify({"ok": True, "dropped": len(ids)})             # сообщаем, сколько отключили
 
 
 @app.get("/api/me")
@@ -1396,6 +1481,9 @@ def bot_card(username):                                       # карточка
         "created": u.get("created", 0),                       # когда создан
         "avatar": u.get("avatar") or {"kind": "color", "value": "#6c5cff"},   # аватар
         "bot": True,                                          # пометка для интерфейса
+        # Сколько людей пользуется ботом: считаем переписки, где он есть. Статус
+        # «был(а) в сети» у ботов не показываем — это бессмысленно.
+        "users": sum(1 for c in DB["chats"] if username in (c or "").split("|") and "|s" not in c),
     }
 
 
@@ -1442,7 +1530,8 @@ def api_bot_new_token():
     username = user_by_token((request.get_json(silent=True) or {}).get("token"))   # проверяем владельца
     if not username:                                          # нет доступа
         return jsonify({"error": "unauthorized"}), 401
-    bot_login = ((request.get_json(silent=True) or {}).get("bot") or "").strip().lower()   # логин бота
+    данные = request.get_json(silent=True) or {}                # тело запроса (читаем один раз)
+    bot_login = (данные.get("bot") or данные.get("username") or "").strip().lower()   # логин бота: принимаем оба названия поля
     u = DB["users"].get(bot_login) or {}                      # запись бота
     if u.get("owner") != username:                            # это не мой бот
         return jsonify({"error": "Это не ваш бот"}), 403
@@ -1460,7 +1549,7 @@ def api_bot_delete():
     owner = user_by_token(data.get("token"))                  # проверяем владельца
     if not owner:                                             # нет доступа
         return jsonify({"error": "unauthorized"}), 401
-    bot_login = (data.get("bot") or "").strip().lower()       # логин бота
+    bot_login = ((data.get("bot") or data.get("username") or "").strip().lower())   # логин бота: принимаем оба названия поля
     u = DB["users"].get(bot_login) or {}                      # запись бота
     if u.get("owner") != owner:                               # это не мой бот
         return jsonify({"error": "Это не ваш бот"}), 403
@@ -2131,6 +2220,86 @@ def api_chat_wallpaper():
     return jsonify({"ok": True})                                  # готово
 
 
+@app.post("/api/chat/autodelete")
+def api_chat_autodelete():
+    """Включает или выключает автоудаление сообщений в чате (1 день, 7 дней, месяц или свой срок)."""
+    data = request.get_json(silent=True) or {}                    # данные запроса
+    username = user_by_token(data.get("token"))                   # кто меняет
+    if not username:                                              # нет доступа
+        return jsonify({"error": "unauthorized"}), 401
+    chat = data.get("chat") or ""                                 # ID чата или комнаты
+    try:                                                          # срок приходит числом секунд
+        секунд = int(data.get("seconds") or 0)                    # 0 — выключить
+    except Exception:                                             # мусор вместо числа —
+        секунд = 0                                                #   считаем «выключено»
+    if секунд < 0:                                                # отрицательный срок бессмысленен
+        секунд = 0                                                # приводим к нулю
+    if секунд and секунд < 60:                                    # меньше минуты — слишком быстро
+        секунд = 60                                               # минимум одна минута
+    if chat in DB["chats"] or ensure_dm_chat(chat):               # личный чат —
+        chat_meta(chat)["autodelete"] = секунд                     #   записываем срок в настройки чата
+    elif chat in (DB.get("rooms") or {}):                         # комната —
+        room = DB["rooms"][chat]                                  #   её запись
+        if room_role(room, username) not in ("owner", "admin"):   #   менять может только владелец или админ
+            return jsonify({"error": "Автоудаление может менять только администратор"}), 403
+        room["autodelete"] = секунд                               #   запоминаем срок
+    else:                                                         # чата нет —
+        return jsonify({"error": "Чат не найден"}), 404            #   сообщаем
+    save_db()                                                     # сохраняем
+    if chat in DB["chats"]:                                       # личный чат —
+        участники = [p for p in chat.split("|") if p in DB["users"]]   #   оба собеседника
+    else:                                                         # комната —
+        участники = [m for m in (DB["rooms"][chat].get("members") or {}) if m in DB["users"]]   #   все её участники
+    for кто in участники:                                         # каждому участнику —
+        safe_emit("chats_update", {"chats": chat_list_for(кто)}, room=f"u:{кто}")   #   обновляем список чатов
+        safe_emit("chat_autodelete", {"chat": chat, "seconds": секунд}, room=f"u:{кто}")   #   и сообщаем новый срок
+    return jsonify({"ok": True, "seconds": секунд})               # готово
+
+
+def purge_expired():
+    """Убирает сообщения, у которых вышел срок автоудаления. Вызывается по таймеру."""
+    удалено = 0                                                   # сколько сообщений убрали
+    with DB_LOCK:                                                 # меняем базу под замком
+        for cid, chat in list(DB["chats"].items()):                # по всем личным чатам
+            авто = int((chat.get("meta") or {}).get("autodelete") or 0)   # срок автоудаления
+            if not авто:                                          # выключено —
+                continue                                          #   пропускаем
+            порог = time.time() - авто                             # что уже должно было исчезнуть
+            было = len(chat.get("messages") or [])                 # сколько сообщений было
+            chat["messages"] = [m for m in (chat.get("messages") or []) if m.get("ts", 0) >= порог]   # оставляем только свежие
+            if len(chat["messages"]) != было:                      # что-то убрали —
+                удалено += было - len(chat["messages"])            #   считаем
+                for part in cid.split("|"):                        # и сообщаем участникам
+                    if part in DB["users"]:                        #   если такой человек есть
+                        safe_emit("chat_purged", {"chat": cid}, room=f"u:{part}")   #   просим перерисовать переписку
+        for rid, room in list((DB.get("rooms") or {}).items()):    # и по комнатам
+            авто = int(room.get("autodelete") or 0)                # срок
+            if not авто:                                           # выключено —
+                continue                                           #   пропускаем
+            порог = time.time() - авто                             # граница
+            room["messages"] = [m for m in (room.get("messages") or []) if m.get("ts", 0) >= порог]   # чистим
+        if удалено:                                                # было что удалять —
+            save_db()                                              #   сохраняем
+    return удалено                                                # отдаём число
+
+
+@app.get("/api/qr")
+def api_qr():
+    """Рисует QR-код для ссылки (профиль, группа или канал). Ничего лишнего не сохраняем."""
+    текст = (request.args.get("text") or "").strip()              # что закодировать
+    if not текст or len(текст) > 600:                             # пусто или слишком длинно —
+        return jsonify({"error": "Нечего кодировать"}), 400        #   отказываем
+    try:                                                          # библиотека может быть не установлена
+        import qrcode                                             # генератор QR-кодов
+        from io import BytesIO                                    # буфер в памяти
+        картинка = qrcode.make(текст)                             # рисуем код
+        буфер = BytesIO()                                         # буфер для картинки
+        картинка.save(буфер, format="PNG")                        # сохраняем в PNG
+        return app.response_class(буфер.getvalue(), mimetype="image/png")   # отдаём картинку
+    except Exception:                                             # библиотеки нет или ошибка —
+        return jsonify({"error": "QR временно недоступен"}), 503   #   сообщаем клиенту
+
+
 @app.post("/api/chat/block")
 def api_chat_block():
     """Блокировка человека: он видит «был(а) давно», без аватарки, а переписка пропадает."""
@@ -2738,6 +2907,16 @@ def on_call_end(data):
 #  комнаты выдаётся участникам в виде «конверта», зашифрованного на ИХ личный
 #  ключ. Сервер такой конверт открыть не может — значит, и переписку прочитать.
 # ---------------------------------------------------------------------------
+ПРЕДЕЛ_НАЗВАНИЯ = 60                                            # сколько символов разрешено в названии чата, группы, канала
+ПРЕДЕЛ_ОПИСАНИЯ = 300                                           # сколько символов разрешено в описании
+
+
+def обрезать_текст(значение, предел):
+    """Приводит подпись к разумной длине: убирает лишние пробелы и обрезает хвост."""
+    текст = (значение or "").strip()                            # убираем пробелы по краям
+    return текст[:предел]                                       # берём не больше разрешённого
+
+
 def room_of(room_id):
     """Возвращает комнату по ID или None."""
     return DB.get("rooms", {}).get(room_id)                        # комната из базы
@@ -2871,8 +3050,8 @@ def on_create_room(data):
     room = {
         "id": room_id,                                             # идентификатор
         "type": rtype,                                             # group или channel
-        "title": title,                                            # название
-        "about": about,                                            # описание
+        "title": обрезать_текст(title, ПРЕДЕЛ_НАЗВАНИЯ),            # название (не длиннее 60 символов)
+        "about": обрезать_текст(about, ПРЕДЕЛ_ОПИСАНИЯ),            # описание (не длиннее 300 символов)
         "color": color,                                            # цвет аватара
         "owner": username,                                         # владелец
         "handle": handle,                                          # @адрес (может быть пустым)
@@ -3133,6 +3312,25 @@ def on_get_rooms():
 
 
 # ---------------------------------------------------------------------------
+def start_autodelete_keeper():
+    """Раз в минуту убирает сообщения, у которых вышел срок автоудаления."""
+    import threading                                              # потоки нужны, чтобы работать в фоне
+
+    def цикл():                                                   # сама работа
+        while True:                                               # бесконечно
+            time.sleep(60)                                        # раз в минуту
+            try:                                                  # ошибки не должны ронять сервер
+                убрано = purge_expired()                          # чистим просроченные
+                if убрано:                                        # если что-то удалили —
+                    print(f"[GeoMetric] Автоудаление убрало сообщений: {убрано}")   # пишем в лог только число
+            except Exception:                                     # любая ошибка —
+                pass                                              #   просто продолжаем
+
+    поток = threading.Thread(target=цикл, daemon=True)            # фоновый поток
+    поток.start()                                                 # запускаем
+    return поток                                                  # отдаём (на случай остановки)
+
+
 def main():
     """Точка входа: параметры командной строки и старт сервера."""
     parser = argparse.ArgumentParser(description="GeoMetric — сервер мессенджера со сквозным шифрованием")
@@ -3161,6 +3359,7 @@ def main():
     ensure_sticker_bot()                                          # создаём служебного Стикер-бота (если его ещё нет)
     ensure_system_user()                                          # создаём служебный аккаунт GeoMetric (владелец проекта)
     start_users_keeper()                                          # включаем хранение аккаунтов в папке users (они не пропадут)
+    start_autodelete_keeper()                                     # включаем автоудаление сообщений по расписанию
 
     users = len(DB["users"])                                      # сколько пользователей уже зарегистрировано
     print("=" * 64)
