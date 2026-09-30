@@ -1235,7 +1235,12 @@ def без_залипших_копий(response):
         response.headers["Pragma"] = "no-cache"                    # и для старых браузеров
     return response                                                # отдаём ответ
 
+@app.get("/google5036fe8a4456a45b.html")
+def google_verify():
+    """Файл подтверждения прав Google Search Console."""
+    return send_from_directory(BASE_DIR, "google5036fe8a4456a45b.html", mimetype="text/html")
 
+  
 @app.get("/")
 def status_page():
     """Главная страница сервера.
