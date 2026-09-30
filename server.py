@@ -1240,6 +1240,25 @@ def google_verify():
     """Файл подтверждения прав Google Search Console."""
     return send_from_directory(BASE_DIR, "google5036fe8a4456a45b.html", mimetype="text/html")
 
+@app.get("/robots.txt")
+def robots():
+    return send_from_directory(BASE_DIR, "robots.txt", mimetype="text/plain")
+  
+@app.get("/sitemap.xml")
+def sitemap():
+    """Карта сайта для поисковых систем."""
+    base = request.url_root.rstrip("/")
+    urls = [
+        {"loc": f"{base}/", "changefreq": "daily", "priority": "1.0"},
+    ]
+    xml = ['<?xml version="1.0" encoding="UTF-8"?>',
+           '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">']
+    for u in urls:
+        xml.append(f'  <url><loc>{u["loc"]}</loc>'
+                   f'<changefreq>{u["changefreq"]}</changefreq>'
+                   f'<priority>{u["priority"]}</priority></url>')
+    xml.append('</urlset>')
+    return app.response_class("\n".join(xml), mimetype="application/xml")
   
 @app.get("/")
 def status_page():
