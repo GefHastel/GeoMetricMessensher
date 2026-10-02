@@ -1,3 +1,0 @@
-User-agent: *
-Allow: /
-Sitemap: https://geometricmessensher.onrender.com/sitemap.xml
