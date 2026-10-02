@@ -2,3 +2,4 @@ aiohttp>=3.9
 python-socketio>=5.11
 asyncpg>=0.29
 tzdata
+python-dotenv
