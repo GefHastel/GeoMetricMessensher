@@ -1,0 +1,56 @@
+# Render Blueprint — GeoMetric Beta (Python)
+# Render → New → Blueprint → выберите репозиторий с этим файлом.
+# Один веб-сервис на Python отдаёт и сайт (public/), и API, и WebSocket.
+databases:
+  - name: geometric-db
+    plan: free
+    databaseName: geometric
+    user: geometric
+
+services:
+  - type: web
+    name: geometric-beta
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: DATABASE_URL            # аккаунты, чаты и медиа лежат в Postgres и переживают перезапуски
+        fromDatabase:
+          name: geometric-db
+          property: connectionString
+      - key: CODE_SECRET
+        generateValue: true
+      # --- владелец и консоль ---
+      - key: ADMIN_KEY               # ключ веб-консоли и manage.py (сгенерируется; посмотрите в Render → Environment)
+        generateValue: true
+      - key: OWNER_EMAILS            # ваш e-mail (можно несколько через запятую) — войдя с ним, вы владелец
+        sync: false
+      - key: PUBLIC_URL              # напр. https://geometric-beta.onrender.com — для ссылок профиля и QR
+        sync: false
+      # --- GeoAI (нужен любой OpenAI-совместимый ключ; есть бесплатные) ---
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_BASE_URL             # Groq: https://api.groq.com/openai/v1
+        value: https://api.groq.com/openai/v1
+      - key: AI_MODEL
+        value: llama-3.3-70b-versatile
+      # --- почта: задайте ОДИН из вариантов, иначе код показывается на экране (демо-режим) ---
+      - key: BREVO_API_KEY           # https://brevo.com → SMTP & API → API keys
+        sync: false
+      - key: RESEND_API_KEY          # или https://resend.com
+        sync: false
+      - key: MAIL_FROM               # напр. no-reply@ваш-домен (для Brevo — подтверждённый отправитель)
+        sync: false
+      - key: HIDE_DEV_CODE           # 1 = никогда не показывать код на экране (включите после настройки почты)
+        value: "0"
+      # --- звонки за NAT (необязательно): свой TURN-сервер ---
+      - key: TURN_URL
+        sync: false
+      - key: TURN_USER
+        sync: false
+      - key: TURN_PASS
+        sync: false

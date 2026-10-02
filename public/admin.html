@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GeoMetric — консоль владельца</title>
+<style>
+body{margin:0;background:#0c1018;color:#d7e2f0;font:14px/1.45 ui-monospace,Consolas,monospace}
+.w{max-width:900px;margin:0 auto;padding:18px}
+h1{font:600 18px system-ui;margin:0 0 12px}
+#out{white-space:pre-wrap;background:#080b11;border:1px solid #1d2635;border-radius:10px;padding:12px;min-height:50vh;max-height:68vh;overflow:auto}
+.r{display:flex;gap:8px;margin-top:10px}
+input{flex:1;min-width:0;background:#111826;border:1px solid #26334a;border-radius:8px;color:#fff;padding:10px;font:inherit}
+button{background:#3390ec;border:0;border-radius:8px;color:#fff;padding:10px 16px;font:600 14px system-ui;cursor:pointer}
+.p{color:#5eb5f7}.e{color:#ff8c8c}.m{color:#7d8ba1}
+</style></head><body><div class="w">
+<h1>GeoMetric Beta — консоль владельца</h1>
+<div class="r"><input id="k" type="password" placeholder="ADMIN_KEY (из Render → Environment)" autocomplete="off"><button id="ok">Войти</button></div>
+<div id="out" style="margin-top:10px"><span class="m">Введите ADMIN_KEY, затем команды: help, stats, verify @ник, geo @ник …</span></div>
+<div class="r"><input id="c" placeholder="geo> команда" autocomplete="off" disabled><button id="go" disabled>Выполнить</button>
+<button id="zip" disabled style="background:#2b3a55">ZIP</button></div></div>
+<script>
+const $=i=>document.getElementById(i),out=$('out');let key=sessionStorage.gmk||'';
+function pr(t,c){const d=document.createElement('div');d.className=c||'';d.textContent=t;out.appendChild(d);out.scrollTop=1e9}
+async function run(cmd){pr('geo> '+cmd,'p');try{const r=await fetch('/api/admin/console',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Key':key},body:JSON.stringify({cmd})});
+ if(r.status==401){pr('Неверный ключ (или ADMIN_KEY не задан на сервере).','e');return false}
+ pr((await r.json()).out||'(пусто)');return true}catch(e){pr('Ошибка сети','e');return false}}
+async function login(){key=$('k').value||key;if(!key)return;out.innerHTML='';if(await run('stats')){sessionStorage.gmk=key;$('c').disabled=$('go').disabled=$('zip').disabled=false;$('c').focus()}}
+$('ok').onclick=login;$('k').onkeydown=e=>e.key=='Enter'&&login();
+function go(){const v=$('c').value.trim();if(v){$('c').value='';run(v)}}
+$('go').onclick=go;$('c').onkeydown=e=>e.key=='Enter'&&go();
+$('zip').onclick=async()=>{const r=await fetch('/api/admin/export',{headers:{'X-Admin-Key':key}});if(!r.ok)return pr('Ошибка экспорта '+r.status,'e');
+ const a=document.createElement('a');a.href=URL.createObjectURL(await r.blob());a.download='geometric-backup.zip';a.click();pr('Архив скачан.')};
+if(key){$('k').value=key;login()}
+</script></body></html>
