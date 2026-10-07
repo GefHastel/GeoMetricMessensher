@@ -8,6 +8,7 @@ function buildApp() {
     <div class="sb-head"><button class="btn-icon" id="btn-menu" title="${t('Меню')}">${ic('menu')}</button>
       <div class="search-box"><input id="search" placeholder="${t('Поиск')}" autocomplete="off">${ic('search')}</div>
       <button class="btn-icon hidden" id="search-x">${ic('x')}</button></div>
+    <div id="story-strip" class="story-strip"></div>
     <div class="folders" id="folders"></div>
     <div class="chatlist scroll" id="chatlist"></div>
     <div class="fab" id="fab"><button id="fab-btn" title="${t('Новое сообщение')}">${ic('pencil')}</button></div>
@@ -21,7 +22,7 @@ function buildApp() {
   const si = $('#search'); si.oninput = () => { S.query = si.value.trim(); $('#search-x').classList.toggle('hidden', !si.value); doSearch(); };
   $('#search-x').onclick = () => { si.value = ''; S.query = ''; $('#search-x').classList.add('hidden'); renderChatList(); };
   si.onkeydown = e => { if (e.key === 'Escape') $('#search-x').click(); };
-  initResizer(); renderFolders(); renderChatList(); showEmptyMain();
+  initResizer(); renderFolders(); renderChatList(); showEmptyMain(); initStories();
   document.addEventListener('keydown', globalKeys);
 }
 function initResizer() {
