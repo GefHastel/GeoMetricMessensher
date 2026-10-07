@@ -21,7 +21,7 @@ const pl = (n, a, b, c) => {
 const S = {
   token: localStorage.getItem('gm_token') || '', me: null, users: {}, chats: {}, sid: null, active: null, folder: 'all', typing: {}, mailMode: 'dev',
   cm: null, // current messages {chatId,list,hasBefore,hasAfter}
-  socket: null, call: null, drafts: JSON.parse(localStorage.getItem('gm_drafts') || '{}'), selMode: false, sel: new Set(), pendingN: 0,
+  socket: null, call: null, stories: [], drafts: JSON.parse(localStorage.getItem('gm_drafts') || '{}'), selMode: false, sel: new Set(), pendingN: 0,
 };
 const DEF = { lang: '', theme: 'auto', accent: '', bubble: 'classic', wall: 'default', wallImg: '', doodles: true, wallAnim: true, fs: 16, radius: 12, time24: true, sendEnter: true, anim: true, sound: true, vol: 60, desktop: true, preview: true, bigEmoji: true, autoplay: true, quick: '👍', sbw: 420, contactsJoined: true, micId: '', camId: '', spkId: '', echo: true, noise: true, agc: true };
 let CFG = { ...DEF, ...JSON.parse(localStorage.getItem('gm_cfg') || '{}') };
@@ -51,7 +51,7 @@ function upload(blob, name, onProgress) {
     x.onerror = () => rej({ error: 'network' }); x.send(blob);
   });
 }
-const ERR = { bad_email: 'Некорректный e-mail', too_many: 'Слишком много попыток. Подождите немного', wait: 'Подождите 30 секунд перед повторной отправкой', mail_failed: 'Не удалось отправить письмо. Проверьте настройки почты на сервере', expired: 'Код истёк. Запросите новый', wrong_code: 'Неверный код', username_taken: 'Это имя пользователя занято', bad_username: 'Имя пользователя: 5–32 символа, a-z, 0-9 и _', blocked: 'Вы не можете писать этому пользователю', forbidden: 'Нет прав на это действие', network: 'Ошибка сети', qr_expired: 'QR-код устарел', name_required: 'Введите имя', privacy: 'Настройки приватности пользователя запрещают звонок', busy: 'Пользователь занят', offline: 'Пользователь не в сети', unavailable: 'Звонок недоступен', already: 'Вы уже в звонке', banned: 'Аккаунт заблокирован', weak_password: 'Пароль: минимум 6 символов', wrong_password: 'Неверная почта или пароль', bad_archive: 'Некорректный архив', not_found: 'Не найдено' };
+const ERR = { bad_email: 'Некорректный e-mail', too_many: 'Слишком много попыток. Подождите немного', wait: 'Подождите 30 секунд перед повторной отправкой', mail_failed: 'Не удалось отправить письмо. Проверьте настройки почты на сервере', expired: 'Код истёк. Запросите новый', wrong_code: 'Неверный код', username_taken: 'Это имя пользователя занято', bad_username: 'Имя пользователя: 5–32 символа, a-z, 0-9 и _', blocked: 'Вы не можете писать этому пользователю', forbidden: 'Нет прав на это действие', network: 'Ошибка сети', qr_expired: 'QR-код устарел', name_required: 'Введите имя', privacy: 'Настройки приватности пользователя запрещают звонок', busy: 'Пользователь занят', offline: 'Пользователь не в сети', unavailable: 'Звонок недоступен', already: 'Вы уже в звонке', banned: 'Аккаунт заблокирован', weak_password: 'Пароль: минимум 6 символов', wrong_password: 'Неверная почта или пароль', bad_archive: 'Некорректный архив', not_found: 'Не найдено', story_limit: 'Лимит активных историй достигнут', story_empty: 'Добавьте текст или фото/видео', bad_media: 'Не удалось использовать этот файл' };
 const errText = e => e?.error === 'banned' ? t('Аккаунт заблокирован') + (e.reason ? ': ' + e.reason : '') : t(ERR[e?.error] || 'Что-то пошло не так');
 function connectSocket() {
   if (S.socket) S.socket.disconnect();
@@ -61,6 +61,7 @@ function connectSocket() {
   s.on('chat:update', d => { mergeUsers(d.users); upsertChat(d.chat); }); s.on('chat:read', onChatRead); s.on('chat:left', d => { delete S.chats[d.chatId]; if (S.active === d.chatId) closeChat(); renderChatList(); });
   s.on('chat:cleared', d => { const c = S.chats[d.chatId]; if (d.hide) { delete S.chats[d.chatId]; if (S.active === d.chatId) closeChat(); } else if (c) { c.last = null; c.unread = 0; if (S.active === d.chatId) openChat(d.chatId, { force: true }); } renderChatList(); });
   s.on('typing', onTyping); s.on('presence', d => { mergeUsers([d.user]); onPresence(d.user); });
+  s.on('story:changed', () => window.refreshStories && refreshStories());
   s.on('me:update', d => { S.me = d.user; S.users[S.me.id] = S.me; renderChatList(); if (window.refreshPanels) refreshPanels(); });
   s.on('settings:sync', d => { if (d.from !== S.sid) { CFG = { ...DEF, ...d.settings }; localStorage.setItem('gm_cfg', JSON.stringify(CFG)); LANG = CFG.lang; applyTheme(); } });
   s.on('session:revoked', () => forceLogout(true));

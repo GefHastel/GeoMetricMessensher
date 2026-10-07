@@ -128,7 +128,7 @@ _saving = False
 
 
 def blank():
-    return {'users': {}, 'sessions': {}, 'chats': {}, 'messages': {}, 'scheduled': [], 'usernames': {}, 'reports': [], 'sys': {},
+    return {'users': {}, 'sessions': {}, 'chats': {}, 'messages': {}, 'scheduled': [], 'stories': [], 'usernames': {}, 'reports': [], 'sys': {},
             'c': {'user': 0, 'msg': 0, 'chat': 0, 'sched': 0, 'report': 0}}
 
 
@@ -1081,6 +1081,113 @@ def bootstrap(c: Ctx):
         if ch.get('peer'): uids.append(ch['peer'])
         if ch.get('last'): uids.append(ch['last']['from'])
     return {'me': pub(c.me, uid), 'chats': chats, 'users': pubs(uids, uid), 'sid': c.s['sid'], 'mail': mail_provider() or 'dev'}
+
+
+def _active_stories():
+    """Drop expired stories lazily so old installations need no migration job."""
+    stories = db.setdefault('stories', [])
+    active = [s for s in stories if toint(s.get('expires'), 0) > now() and U(toint(s.get('userId'), -1))]
+    if len(active) != len(stories):
+        db['stories'] = active
+        save()
+    return active
+
+
+def _story_allowed(story, viewer):
+    owner = U(toint(story.get('userId'), -1))
+    viewer_user = U(viewer)
+    if not owner or not viewer_user or owner.get('deleted'):
+        return False
+    if viewer == owner['id']:
+        return True
+    if viewer in (owner.get('blocked') or []) or owner['id'] in (viewer_user.get('blocked') or []):
+        return False
+    return story.get('audience', 'all') != 'contacts' or viewer in (owner.get('contacts') or [])
+
+
+def _story_public(story, viewer):
+    out = {k: story[k] for k in ('id', 'userId', 'type', 'text', 'media', 'ts', 'expires', 'audience') if story.get(k) is not None}
+    out['seen'] = viewer in story.get('viewedBy', []) or viewer == story['userId']
+    out['views'] = len(story.get('viewedBy', []))
+    if viewer == story['userId']:
+        out['viewers'] = list(story.get('viewedBy', []))
+    return out
+
+
+@route('GET', '/api/stories')
+def get_stories(c: Ctx):
+    grouped = {}
+    all_stories = _active_stories()
+    for story in all_stories:
+        if not _story_allowed(story, c.uid):
+            continue
+        owner_id = story['userId']
+        grouped.setdefault(owner_id, []).append(_story_public(story, c.uid))
+    stories = []
+    for owner_id, items in grouped.items():
+        owner = U(owner_id)
+        if owner:
+            items.sort(key=lambda item: item['ts'])
+            stories.append({'user': pub(owner, c.uid), 'items': items})
+    stories.sort(key=lambda x: (x['user']['id'] != c.uid,
+                                all(item['seen'] for item in x['items']),
+                                -x['items'][-1]['ts']))
+    return {'stories': stories, 'users': [group['user'] for group in stories]}
+
+
+@route('POST', '/api/stories')
+def create_story(c: Ctx):
+    if limited(f'story:{c.uid}', 12, 24 * 60 * 60 * 1000):
+        err(429, 'too_many')
+    active = _active_stories()
+    mine = [s for s in active if s['userId'] == c.uid]
+    if len(mine) >= 20:
+        err(400, 'story_limit')
+    b = c.body
+    typ = b.get('type') if b.get('type') in ('text', 'photo', 'video') else 'text'
+    text = clamp(b.get('text'), 500 if typ == 'text' else 300).strip()
+    media = b.get('media')
+    if typ == 'text' and not text:
+        err(400, 'story_empty')
+    if typ != 'text' and (not isinstance(media, str) or not MEDIA_RE.fullmatch(media)):
+        err(400, 'bad_media')
+    if typ != 'text' and not text and not media:
+        err(400, 'story_empty')
+    audience = 'contacts' if b.get('audience') == 'contacts' else 'all'
+    ts = now()
+    story = {'id': rid(12), 'userId': c.uid, 'type': typ, 'text': text, 'ts': ts,
+             'expires': ts + 24 * 60 * 60 * 1000, 'audience': audience, 'viewedBy': []}
+    if media:
+        story['media'] = media
+    db.setdefault('stories', []).append(story)
+    save()
+    emit_room(None, 'story:changed', {'userId': c.uid})
+    return {'story': _story_public(story, c.uid)}
+
+
+@route('POST', '/api/stories/{id}/view')
+def view_story(c: Ctx):
+    story = next((s for s in _active_stories() if s['id'] == c.params['id']), None)
+    if not story or not _story_allowed(story, c.uid):
+        err(404, 'not_found')
+    if story['userId'] != c.uid and c.uid not in story.setdefault('viewedBy', []):
+        story['viewedBy'].append(c.uid)
+        save()
+    return {'story': _story_public(story, c.uid)}
+
+
+@route('DELETE', '/api/stories/{id}')
+def delete_story(c: Ctx):
+    stories = _active_stories()
+    story = next((s for s in stories if s['id'] == c.params['id']), None)
+    if not story:
+        err(404, 'not_found')
+    if story['userId'] != c.uid:
+        err(403, 'forbidden')
+    db['stories'] = [s for s in stories if s['id'] != story['id']]
+    save()
+    emit_room(None, 'story:changed', {'userId': c.uid})
+    return {'ok': True}
 
 
 @route('POST', '/api/chats/private')
